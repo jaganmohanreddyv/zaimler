@@ -1,0 +1,42 @@
+# Credentials and secrets
+config.env
+*.pem
+*.key
+.env
+.env.*
+
+# AWS credentials
+.aws/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Temp files
+*.bak.*
+*.bak
+/tmp/
+trust_policy_*.json
+gpu_perms_*.json
+lt_data_*.json
+config_clean_*.env
+
+# Lambda deployment packages
+watcher/*.zip
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+
+# Logs
+*.log
