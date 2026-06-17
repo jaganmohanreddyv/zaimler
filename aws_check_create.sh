@@ -15,12 +15,14 @@
 #  NEW-1  Section 3.5 — Cluster placement group (required for p5/p4d/trn2)
 #  NEW-2  Section 7   — Launch template with CapacityReservationTarget
 #  NEW-3  --dry-run flag: audit-only mode, no AWS resources created
+#  NEW-4  Section 7   — Instance type mismatch detection: if config.env
+#          INSTANCE_TYPES changed since template was created, a new version
+#          is created automatically with the correct AMI and instance type
 # =============================================================================
 
 set -euo pipefail
 
 # ── Dry-run flag ──────────────────────────────────────────────────────────────
-# FIX: NEW-3 — pass --dry-run to audit without creating anything
 DRY_RUN=false
 for arg in "$@"; do
   [[ "$arg" == "--dry-run" ]] && DRY_RUN=true
@@ -37,7 +39,6 @@ fi
 
 # ── Source config ─────────────────────────────────────────────────────────────
 set +u
-# Strip Windows carriage returns before sourcing
 CLEAN_ENV="/tmp/config_clean_$$.env"
 sed 's/\r//' "$CONFIG_FILE" > "$CLEAN_ENV"
 source "$CLEAN_ENV"
@@ -55,15 +56,12 @@ fail()   { echo -e "${RED}  ✖  $*${NC}"; }
 header() { echo -e "\n${BOLD}━━━━━  $*  ━━━━━${NC}"; }
 dryrun() { echo -e "${CYAN}  [DRY-RUN] would: $*${NC}"; }
 
-# ── FIX-3: Temp file cleanup trap ─────────────────────────────────────────────
-# Register all temp files here; trap removes them on any exit (normal or error).
+# ── Temp file cleanup trap ────────────────────────────────────────────────────
 CLEANUP_FILES=()
 cleanup() { rm -f "${CLEANUP_FILES[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 
-# ── FIX-4: Timestamped patch_config ───────────────────────────────────────────
-# Original: every patch overwrote the same .bak file, losing previous backups.
-# Fixed:    each patch creates a unique timestamped backup so no backup is lost.
+# ── Timestamped patch_config ──────────────────────────────────────────────────
 patch_config() {
   local key="$1" value="$2"
   local ts; ts=$(date +%Y%m%d_%H%M%S)
@@ -76,15 +74,10 @@ patch_config() {
   info "config.env → ${key}=\"${value}\"  (backup: .bak.${ts})"
 }
 
-# ── FIX-5: Pure-bash Windows path helper ──────────────────────────────────────
-# Original used cmd //c "echo %CD%\..." which requires cmd.exe and breaks in WSL2.
-# Fixed: pure bash string replacement — works identically on Linux, Git Bash, WSL.
+# ── Pure-bash Windows path helper ─────────────────────────────────────────────
 to_win_path() {
   local p="$1"
-  # If running in Git Bash on Windows, AWS CLI needs a Windows-style path.
-  # On Linux / WSL2 the path is already correct — return as-is.
   if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == CYGWIN* ]]; then
-    # /c/Users/... → C:\Users\...
     echo "$p" | sed 's|^/\([a-zA-Z]\)/|\u\1:\\|; s|/|\\|g'
   else
     echo "$p"
@@ -94,7 +87,6 @@ to_win_path() {
 # ── AWS CLI sanity check ──────────────────────────────────────────────────────
 if ! command -v aws &>/dev/null; then
   fail "AWS CLI not found."
-  fail "Install: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html"
   exit 1
 fi
 
@@ -106,9 +98,6 @@ if [[ -n "${AWS_PROFILE:-}" ]]; then
   PROFILE_FLAG="--profile ${AWS_PROFILE}"
 fi
 
-# FIX-6: Use explicit error capture instead of || echo ""
-# aws_safe runs a command and returns empty string on failure rather than
-# triggering set -e via subshell exit code propagation.
 aws_cmd()  { aws $PROFILE_FLAG --region "$REGION" --output text "$@"; }
 aws_iam()  { aws $PROFILE_FLAG --output text "$@"; }
 aws_safe() { aws_cmd "$@" 2>/dev/null || true; }
@@ -170,7 +159,7 @@ if [[ "$KEY_EXISTS" == false ]]; then
       exit 1
     }
     if [[ -z "$KEY_MATERIAL" || "$KEY_MATERIAL" == "None" ]]; then
-      fail "Key pair created but private key was empty — delete it in console and retry."
+      fail "Key pair created but private key was empty."
       exit 1
     fi
     printf '%s\n' "$KEY_MATERIAL" > "$KEY_FILE"
@@ -211,14 +200,6 @@ else
 fi
 
 if [[ "$SUBNET_EXISTS" == false ]]; then
-  # ── Subnet interactive selection ──────────────────────────────────────────
-  # 1. Collect ALL available subnets across every VPC in the region
-  # 2. Sort: target-AZ subnets first, other AZs after
-  # 3. Show numbered list with VPC, AZ, CIDR, default labels
-  # 4. If only one option → use it automatically
-  # 5. If multiple → user picks by number (or enters a custom subnet ID)
-  # 6. If none found → print restore command and exit
-
   DEFAULT_VPC=$(aws_safe ec2 describe-vpcs \
     --filters "Name=isDefault,Values=true" \
     --query "Vpcs[0].VpcId")
@@ -226,7 +207,6 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
 
   info "Scanning all VPCs for available subnets in region $REGION..."
 
-  # Fetch every available subnet in the region — tab-separated
   ALL_RAW=$(aws_safe ec2 describe-subnets \
     --filters "Name=state,Values=available" \
     --query "Subnets[*].[SubnetId,AvailabilityZone,CidrBlock,VpcId,DefaultForAz]" \
@@ -234,12 +214,8 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
 
   if [[ -z "$ALL_RAW" ]]; then
     fail "No available subnets found in region $REGION."
-    warn "Restore default VPC subnets with:"
-    warn "  aws ec2 create-default-subnet --availability-zone $AZ"
-    warn "Or set SUBNET_ID manually in config.env and re-run."
     SKIPPED+=("Subnet: no subnets found — manual action required")
   else
-    # ── Build two arrays: preferred (target AZ) and fallback (other AZs) ────
     declare -a PREF_IDS=()  PREF_AZS=()  PREF_CIDRS=()  PREF_VPCS=()  PREF_DEFS=()
     declare -a OTHER_IDS=() OTHER_AZS=() OTHER_CIDRS=() OTHER_VPCS=() OTHER_DEFS=()
 
@@ -254,7 +230,6 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
       fi
     done <<< "$ALL_RAW"
 
-    # ── Print the selection menu ─────────────────────────────────────────────
     echo ""
     echo -e "${BOLD}  Available subnets — choose one:${NC}"
     echo ""
@@ -262,7 +237,6 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
     IDX=1
     declare -a MENU_IDS=() MENU_AZS=() MENU_VPCS=()
 
-    # Print target-AZ subnets first (highlighted)
     if [[ ${#PREF_IDS[@]} -gt 0 ]]; then
       echo -e "  ${GREEN}── Subnets in your target AZ ($AZ) ──────────────────────────${NC}"
       for i in "${!PREF_IDS[@]}"; do
@@ -280,7 +254,6 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
       echo ""
     fi
 
-    # Print other-AZ subnets after
     if [[ ${#OTHER_IDS[@]} -gt 0 ]]; then
       echo -e "  ${YELLOW}── Subnets in other AZs ──────────────────────────────────────${NC}"
       for i in "${!OTHER_IDS[@]}"; do
@@ -300,12 +273,9 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
 
     TOTAL_OPTIONS=${#MENU_IDS[@]}
 
-    # ── Auto-select if only one option ───────────────────────────────────────
     if [[ $TOTAL_OPTIONS -eq 1 ]]; then
       CHOSEN_IDX=0
       info "Only one subnet available — selecting automatically."
-
-    # ── Prompt user to choose ─────────────────────────────────────────────────
     else
       echo -e "  ${CYAN}[c]${NC}  Enter a custom subnet ID not listed above"
       echo ""
@@ -320,7 +290,6 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
             fail "Subnet ID cannot be empty."
             continue
           fi
-          # Validate custom subnet
           CUSTOM_INFO=$(aws_safe ec2 describe-subnets \
             --subnet-ids "$CUSTOM_SUBNET" \
             --query "Subnets[0].[SubnetId,AvailabilityZone,CidrBlock,VpcId]" 2>/dev/null || echo "")
@@ -357,7 +326,6 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
       done
     fi
 
-    # ── Apply the numbered selection ──────────────────────────────────────────
     if [[ "$SUBNET_EXISTS" == false ]]; then
       SEL_ID="${MENU_IDS[$CHOSEN_IDX]}"
       SEL_AZ="${MENU_AZS[$CHOSEN_IDX]}"
@@ -386,6 +354,7 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
     fi
   fi
 fi
+
 # =============================================================================
 # 3. SECURITY GROUP
 # =============================================================================
@@ -413,8 +382,6 @@ else
 fi
 
 if [[ "$SG_EXISTS" == false ]]; then
-  # Derive VPC from existing subnet so SG is always in the same VPC.
-  # This prevents VPC mismatch when the subnet is not in the default VPC.
   SG_VPC=""
   CURRENT_SUBNET_FOR_SG="${SUBNET_ID:-}"
   if [[ -n "$CURRENT_SUBNET_FOR_SG" ]]; then
@@ -438,9 +405,6 @@ if [[ "$SG_EXISTS" == false ]]; then
     read -rp "  Name for new security group [gpu-sg]: " NEW_SG_NAME
     NEW_SG_NAME="${NEW_SG_NAME:-gpu-sg}"
 
-    # ── FIX-1: Safe SSH CIDR — auto-detect IP, never allow 0.0.0.0/0 default ──
-    # Original defaulted to 0.0.0.0/0 if user pressed Enter.
-    # Fixed: auto-detect public IP via AWS; block 0.0.0.0/0 explicitly.
     DETECTED_IP=$(curl -sf --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || echo "")
     if [[ -n "$DETECTED_IP" ]]; then
       DEFAULT_CIDR="${DETECTED_IP}/32"
@@ -459,7 +423,6 @@ if [[ "$SG_EXISTS" == false ]]; then
       fi
       if [[ "$SSH_CIDR" == "0.0.0.0/0" ]]; then
         fail "0.0.0.0/0 opens SSH to the entire internet — not allowed."
-        fail "Enter your specific IP (e.g. 203.0.113.42/32)."
         continue
       fi
       break
@@ -475,12 +438,10 @@ if [[ "$SG_EXISTS" == false ]]; then
         --vpc-id "$DEFAULT_VPC" \
         --query "GroupId")
 
-      # SSH from your IP only
       aws_cmd ec2 authorize-security-group-ingress \
         --group-id "$NEW_SG_ID" \
         --protocol tcp --port 22 --cidr "$SSH_CIDR" > /dev/null
 
-      # Allow all traffic within the same SG — required for NCCL inter-node comms
       aws_cmd ec2 authorize-security-group-ingress \
         --group-id "$NEW_SG_ID" \
         --protocol -1 --port -1 \
@@ -499,11 +460,8 @@ if [[ "$SG_EXISTS" == false ]]; then
 fi
 
 # =============================================================================
-# 3.5 (NEW) CLUSTER PLACEMENT GROUP
+# 3.5 CLUSTER PLACEMENT GROUP
 # =============================================================================
-# NEW-1: Added. Required for p5/p4d/trn2 multi-node GPU workloads.
-# Without a cluster placement group, nodes are not guaranteed to land on the
-# same high-bandwidth spine, and NCCL collective operations slow down 10x.
 header "3.5 / 8  Cluster Placement Group  (NEW)"
 
 CURRENT_PG="${PLACEMENT_GROUP_NAME:-}"
@@ -588,7 +546,6 @@ if [[ "$PROFILE_EXISTS" == false ]]; then
     dryrun "iam create-role $ROLE_NAME + create-instance-profile $NEW_PROFILE_NAME"
     SKIPPED+=("IAM instance profile: dry-run, would create $NEW_PROFILE_NAME")
   else
-    # FIX-3: register temp file so trap cleans it on any exit
     TRUST_FILE="./trust_policy_$$.json"
     CLEANUP_FILES+=("$TRUST_FILE")
 
@@ -603,7 +560,6 @@ if [[ "$PROFILE_EXISTS" == false ]]; then
 }
 EOF
 
-    # FIX-5: use pure-bash path conversion instead of cmd //c
     TRUST_FILE_NATIVE=$(to_win_path "$TRUST_FILE")
 
     aws_iam iam create-role \
@@ -640,9 +596,7 @@ fi
 # =============================================================================
 header "5 / 8  SNS Topic + Email Subscription"
 
-# Use the name from config.env as default — never fall back to a hardcoded string
-  # that differs from what the config expects.
-  SNS_NAME="${SNS_TOPIC_NAME:-gpu-capacity-alerts}"
+SNS_NAME="${SNS_TOPIC_NAME:-gpu-capacity-alerts}"
 ALERT_EMAIL_ADDR="${ALERT_EMAIL:-}"
 SNS_EXISTS=false
 
@@ -674,7 +628,6 @@ else
   fi
 fi
 
-# Email subscription + FIX-7: warn loudly if no confirmed subscriptions
 if [[ -n "$ALERT_EMAIL_ADDR" && "$DRY_RUN" == false ]]; then
   SUB_STATUS=$(aws_cmd sns list-subscriptions-by-topic \
     --topic-arn "$SNS_ARN" \
@@ -697,7 +650,6 @@ if [[ -n "$ALERT_EMAIL_ADDR" && "$DRY_RUN" == false ]]; then
     CREATED+=("SNS subscription: $ALERT_EMAIL_ADDR  (confirm email sent)")
   fi
 
-  # FIX-7: Check if topic has zero confirmed subscriptions and warn loudly
   CONFIRMED_COUNT=$(aws_cmd sns list-subscriptions-by-topic \
     --topic-arn "$SNS_ARN" \
     --query "Subscriptions[?SubscriptionArn!='PendingConfirmation'].SubscriptionArn" \
@@ -725,12 +677,10 @@ POLICY_NAME="gpu-deployment-permissions"
 
 if [[ -z "$CALLER_USER" ]]; then
   warn "Caller is not an IAM user ($CALLER_ARN) — cannot attach policy to user."
-  warn "Grant the deployment actions to the role / SSO permission set manually."
   SKIPPED+=("IAM permissions: caller is not a user — manual action required")
 else
   MANAGED_POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
 
-  # Check if already attached as a managed policy
   EXISTING_MANAGED=$(aws_iam iam list-attached-user-policies \
     --user-name "$CALLER_USER" \
     --query "AttachedPolicies[?PolicyName=='${POLICY_NAME}'].PolicyName" \
@@ -743,13 +693,9 @@ else
     dryrun "iam create-policy + attach-user-policy --user-name $CALLER_USER --policy-name $POLICY_NAME"
     SKIPPED+=("IAM permissions: dry-run, would attach $POLICY_NAME to $CALLER_USER")
   else
-    # FIX-3: register temp file for trap cleanup
     PERM_FILE="./gpu_perms_$$.json"
     CLEANUP_FILES+=("$PERM_FILE")
 
-    # Using customer-managed policy (create-policy + attach-user-policy) instead
-    # of inline put-user-policy because inline policies are hard-capped at 2048
-    # bytes — too small for all needed actions. Managed policies allow 6144 bytes.
     cat > "$PERM_FILE" <<'EOF'
 {
   "Version": "2012-10-17",
@@ -774,6 +720,7 @@ else
         "ec2:DeleteLaunchTemplate",
         "ec2:CreateLaunchTemplateVersion",
         "ec2:ModifyLaunchTemplate",
+        "ec2:DescribeLaunchTemplateVersions",
         "ec2:DescribeSubnets",
         "ec2:CreateSubnet",
         "ec2:DeleteSubnet",
@@ -924,22 +871,17 @@ else
 }
 EOF
 
-    # FIX-5: pure-bash path conversion
     PERM_FILE_NATIVE=$(to_win_path "$PERM_FILE")
-
     IAM_ERR_FILE="/tmp/iam_perm_err_$$"
     CLEANUP_FILES+=("$IAM_ERR_FILE")
 
-    # Step A: delete any old version of this managed policy so we can recreate it
     EXISTING_POLICY=$(aws_iam iam get-policy \
       --policy-arn "$MANAGED_POLICY_ARN" \
       --query "Policy.Arn" 2>/dev/null || echo "")
     if [[ -n "$EXISTING_POLICY" && "$EXISTING_POLICY" != "None" ]]; then
-      # Detach from user first (ignore errors — may already be detached)
       aws_iam iam detach-user-policy \
         --user-name "$CALLER_USER" \
         --policy-arn "$MANAGED_POLICY_ARN" 2>/dev/null || true
-      # Delete all non-default versions
       NON_DEF=$(aws_iam iam list-policy-versions \
         --policy-arn "$MANAGED_POLICY_ARN" \
         --query "Versions[?!IsDefaultVersion].VersionId" \
@@ -954,30 +896,24 @@ EOF
       info "Removed old version of managed policy $POLICY_NAME"
     fi
 
-    # Step B: create the managed policy
     NEW_POLICY_ARN=$(aws_iam iam create-policy \
       --policy-name "$POLICY_NAME" \
       --policy-document "file://${PERM_FILE_NATIVE}" \
       --query "Policy.Arn" 2>"$IAM_ERR_FILE") || {
       fail "Could not create managed policy: $(tr -d '\r\n' < "$IAM_ERR_FILE")"
-      warn "Your user may lack iam:CreatePolicy — check IAM permissions."
       SKIPPED+=("IAM permissions: create-policy failed — manual action required")
       NEW_POLICY_ARN=""
     }
 
-    # Step C: attach it to the user
     if [[ -n "$NEW_POLICY_ARN" ]]; then
       if aws_iam iam attach-user-policy \
           --user-name "$CALLER_USER" \
           --policy-arn "$NEW_POLICY_ARN" 2>"$IAM_ERR_FILE"; then
         ok "Managed policy '$POLICY_NAME' created and attached to user '$CALLER_USER'."
         info "ARN: $NEW_POLICY_ARN"
-        info "Includes ec2:PurchaseCapacityBlock and ec2:DescribeCapacityBlockOfferings."
-        info "IAM propagation takes a few seconds before simulate reflects the change."
         CREATED+=("IAM permissions: $POLICY_NAME on $CALLER_USER (managed policy)")
       else
         fail "Policy created but could not attach: $(tr -d '\r\n' < "$IAM_ERR_FILE")"
-        warn "Run manually: aws iam attach-user-policy --user-name $CALLER_USER --policy-arn $NEW_POLICY_ARN"
         SKIPPED+=("IAM permissions: attach-user-policy failed — run manually")
       fi
     fi
@@ -985,28 +921,56 @@ EOF
 fi
 
 # =============================================================================
-# 7 (NEW). LAUNCH TEMPLATE
+# 7. LAUNCH TEMPLATE  — with instance type mismatch detection (NEW-4)
 # =============================================================================
-# NEW-2: Added. The launch template is the glue that ties all resources together
-# and — critically — sets CapacityReservationTarget so instances land in your
-# purchased Capacity Block instead of on-demand capacity.
-# Without this, your Capacity Block reservation sits idle and billed unused.
 header "7 / 8  Launch Template  (NEW)"
 
 CURRENT_LT="${LAUNCH_TEMPLATE_NAME:-}"
 LT_EXISTS=false
+LT_NEEDS_UPDATE=false
+
+CB_INSTANCE_TYPE="$(echo "${INSTANCE_TYPES:-p5.48xlarge}" | cut -d"," -f1 | tr -d " ")"
+CB_AMI_ID="${AMI_ID:-}"
+CB_RESERVATION_ID="${CAPACITY_RESERVATION_ID:-}"
 
 if [[ -n "$CURRENT_LT" ]]; then
   LT_LINE=$(aws_safe ec2 describe-launch-templates \
     --launch-template-names "$CURRENT_LT" \
-    --query "LaunchTemplates[0].[LaunchTemplateName,DefaultVersionNumber,LatestVersionNumber]")
+    --query "LaunchTemplates[0].[LaunchTemplateId,DefaultVersionNumber,LatestVersionNumber]")
+
   if [[ -n "$LT_LINE" && "$LT_LINE" != "None" ]]; then
-    LT_NAME_OUT=$(echo "$LT_LINE" | awk '{print $1}')
-    LT_DEF_V=$(echo "$LT_LINE"    | awk '{print $2}')
-    LT_LAT_V=$(echo "$LT_LINE"    | awk '{print $3}')
-    ok "Launch template '$LT_NAME_OUT' exists  (default v$LT_DEF_V, latest v$LT_LAT_V)"
-    LT_EXISTS=true
-    FOUND+=("Launch template: $LT_NAME_OUT  v$LT_LAT_V")
+    LT_ID_FOUND=$(echo "$LT_LINE"  | awk '{print $1}')
+    LT_DEF_V=$(echo "$LT_LINE"     | awk '{print $2}')
+    LT_LAT_V=$(echo "$LT_LINE"     | awk '{print $3}')
+
+    # ── NEW-4: Check instance type in current default version ─────────────────
+    # If config.env INSTANCE_TYPES changed since the template was created,
+    # the existing template has the wrong instance type baked in.
+    # Detect this and create a new version automatically.
+    CURRENT_LT_ITYPE=$(aws_safe ec2 describe-launch-template-versions \
+      --launch-template-id "$LT_ID_FOUND" \
+      --versions "\$Default" \
+      --query "LaunchTemplateVersions[0].LaunchTemplateData.InstanceType")
+
+    ok "Launch template '$CURRENT_LT' exists  (ID: $LT_ID_FOUND, default v$LT_DEF_V, latest v$LT_LAT_V)"
+    info "Template instance type : ${CURRENT_LT_ITYPE:-unknown}"
+    info "config.env instance type: $CB_INSTANCE_TYPE"
+
+    if [[ -n "$CURRENT_LT_ITYPE" && \
+          "$CURRENT_LT_ITYPE" != "None" && \
+          "$CURRENT_LT_ITYPE" != "$CB_INSTANCE_TYPE" ]]; then
+      warn "Instance type mismatch detected!"
+      warn "  Template default version uses : $CURRENT_LT_ITYPE"
+      warn "  config.env INSTANCE_TYPES is  : $CB_INSTANCE_TYPE"
+      warn "  A new launch template version will be created automatically."
+      LT_EXISTS=true
+      LT_NEEDS_UPDATE=true
+      LT_ID_TO_UPDATE="$LT_ID_FOUND"
+    else
+      ok "Instance type matches config.env — no update needed."
+      LT_EXISTS=true
+      FOUND+=("Launch template: $CURRENT_LT  v$LT_LAT_V  instance=$CURRENT_LT_ITYPE")
+    fi
   else
     warn "Launch template '$CURRENT_LT' NOT found."
   fi
@@ -1014,60 +978,38 @@ else
   warn "LAUNCH_TEMPLATE_NAME is empty."
 fi
 
-if [[ "$LT_EXISTS" == false ]]; then
-  echo ""
-  read -rp "  Name for new launch template [gpu-cb-lt]: " NEW_LT_NAME
-  NEW_LT_NAME="${NEW_LT_NAME:-gpu-cb-lt}"
+# ── Resolve AMI for create or update ─────────────────────────────────────────
+resolve_ami() {
+  local itype="$1"
+  local resolved_ami="${CB_AMI_ID:-}"
 
-  # Gather required values from config or prompt
-  CB_INSTANCE_TYPE="$(echo "${INSTANCE_TYPES:-p5.48xlarge}" | cut -d"," -f1 | tr -d " ")"
-  CB_AMI_ID="${AMI_ID:-}"
-  CB_RESERVATION_ID="${CAPACITY_RESERVATION_ID:-}"
+  if [[ -z "$resolved_ami" || "$resolved_ami" == "ami-XXXXXXXX" ]]; then
+    warn "AMI_ID not set or is placeholder — auto-discovering correct AMI for $itype..."
 
-  if [[ -z "$CB_AMI_ID" ]]; then
-    warn "AMI_ID is empty in config.env — looking up latest AMI for $CB_INSTANCE_TYPE…"
-
-    # Trainium instances (trn1, trn2) need Neuron AMIs — not GPU/CUDA AMIs
-    # P-series instances (p4d, p5, p6) need Deep Learning GPU AMIs
-    if [[ "$CB_INSTANCE_TYPE" == trn* ]]; then
-      info "Trainium instance detected — searching for Neuron AMI…"
-      CB_AMI_ID=$(aws_safe ec2 describe-images \
-        --owners amazon \
-        --region "$AWS_REGION" \
+    if [[ "$itype" == trn* ]]; then
+      info "Trainium instance — searching for Neuron AMI..."
+      resolved_ami=$(aws_safe ec2 describe-images \
+        --owners amazon --region "$AWS_REGION" \
         --filters \
           "Name=name,Values=Deep Learning AMI Neuron PyTorch*" \
           "Name=state,Values=available" \
           "Name=architecture,Values=x86_64" \
         --query "sort_by(Images,&CreationDate)[-1].ImageId")
-      # Also try the Base Neuron AMI if PyTorch one not found
-      if [[ -z "$CB_AMI_ID" || "$CB_AMI_ID" == "None" ]]; then
-        CB_AMI_ID=$(aws_safe ec2 describe-images \
-          --owners amazon \
-          --region "$AWS_REGION" \
-          --filters \
-            "Name=name,Values=*Neuron*Amazon Linux 2*" \
-            "Name=state,Values=available" \
-            "Name=architecture,Values=x86_64" \
-          --query "sort_by(Images,&CreationDate)[-1].ImageId")
-      fi
-      # Final fallback — latest Amazon Linux 2023 (works for pipeline testing)
-      if [[ -z "$CB_AMI_ID" || "$CB_AMI_ID" == "None" ]]; then
-        CB_AMI_ID=$(aws_safe ec2 describe-images \
-          --owners amazon \
-          --region "$AWS_REGION" \
+      if [[ -z "$resolved_ami" || "$resolved_ami" == "None" ]]; then
+        resolved_ami=$(aws_safe ec2 describe-images \
+          --owners amazon --region "$AWS_REGION" \
           --filters \
             "Name=name,Values=al2023-ami-2023*" \
             "Name=state,Values=available" \
             "Name=architecture,Values=x86_64" \
           --query "sort_by(Images,&CreationDate)[-1].ImageId")
-        [[ -n "$CB_AMI_ID" && "$CB_AMI_ID" != "None" ]] && \
-          warn "Using Amazon Linux 2023 AMI for testing — install Neuron SDK manually after launch"
+        [[ -n "$resolved_ami" && "$resolved_ami" != "None" ]] && \
+          warn "Using Amazon Linux 2023 AMI — install Neuron SDK manually after launch"
       fi
     else
-      info "GPU instance detected — searching for Deep Learning GPU AMI…"
-      CB_AMI_ID=$(aws_safe ec2 describe-images \
-        --owners amazon \
-        --region "$AWS_REGION" \
+      info "GPU instance — searching for Deep Learning GPU AMI..."
+      resolved_ami=$(aws_safe ec2 describe-images \
+        --owners amazon --region "$AWS_REGION" \
         --filters \
           "Name=name,Values=Deep Learning AMI GPU PyTorch*" \
           "Name=state,Values=available" \
@@ -1075,30 +1017,67 @@ if [[ "$LT_EXISTS" == false ]]; then
         --query "sort_by(Images,&CreationDate)[-1].ImageId")
     fi
 
-    if [[ -n "$CB_AMI_ID" && "$CB_AMI_ID" != "None" ]]; then
-      info "Found AMI: $CB_AMI_ID"
+    if [[ -n "$resolved_ami" && "$resolved_ami" != "None" ]]; then
+      info "Auto-discovered AMI: $resolved_ami"
+      patch_config "AMI_ID" "$resolved_ami"
+      CB_AMI_ID="$resolved_ami"
     else
-      warn "Could not auto-discover AMI."
-      warn "Run this command to find the right AMI for $CB_INSTANCE_TYPE:"
-      warn "  aws ec2 describe-images --owners amazon --region $AWS_REGION \"
-      warn "    --filters 'Name=name,Values=*Neuron*' 'Name=state,Values=available' \"
-      warn "    --query 'sort_by(Images,&CreationDate)[-1].[ImageId,Name]' --output table"
-      warn "Then set AMI_ID=\"<ami-id>\" in config.env and re-run."
-      fail "Cannot create launch template without a valid AMI ID. Exiting."
+      fail "Could not auto-discover AMI for $itype. Set AMI_ID in config.env and re-run."
       exit 1
     fi
   fi
+  echo "$resolved_ami"
+}
+
+# ── Update existing template if instance type mismatch ───────────────────────
+if [[ "$LT_NEEDS_UPDATE" == true ]]; then
+  RESOLVED_AMI=$(resolve_ami "$CB_INSTANCE_TYPE")
+
+  if [[ "$DRY_RUN" == true ]]; then
+    dryrun "ec2 create-launch-template-version on $LT_ID_TO_UPDATE"
+    dryrun "  InstanceType: $CB_INSTANCE_TYPE  AMI: $RESOLVED_AMI"
+    SKIPPED+=("Launch template: dry-run, would update $CURRENT_LT for $CB_INSTANCE_TYPE")
+  else
+    info "Creating new launch template version..."
+    info "  Instance type : $CB_INSTANCE_TYPE"
+    info "  AMI           : $RESOLVED_AMI"
+
+    LT_UPDATE_DATA="{\"ImageId\":\"${RESOLVED_AMI}\",\"InstanceType\":\"${CB_INSTANCE_TYPE}\"}"
+
+    NEW_LT_VERSION=$(aws_cmd ec2 create-launch-template-version \
+      --launch-template-id "$LT_ID_TO_UPDATE" \
+      --source-version "\$Latest" \
+      --version-description "${CB_INSTANCE_TYPE} — updated by aws_check_create.sh" \
+      --launch-template-data "$LT_UPDATE_DATA" \
+      --query "LaunchTemplateVersion.VersionNumber")
+
+    aws_cmd ec2 modify-launch-template \
+      --launch-template-id "$LT_ID_TO_UPDATE" \
+      --default-version "$NEW_LT_VERSION" > /dev/null
+
+    ok "Launch template updated — new default version: v${NEW_LT_VERSION}"
+    ok "  Instance type : $CB_INSTANCE_TYPE"
+    ok "  AMI           : $RESOLVED_AMI"
+    CREATED+=("Launch template update: $CURRENT_LT → v${NEW_LT_VERSION}  ($CB_INSTANCE_TYPE)")
+  fi
+fi
+
+# ── Create template from scratch if it does not exist ────────────────────────
+if [[ "$LT_EXISTS" == false ]]; then
+  echo ""
+  read -rp "  Name for new launch template [gpu-cb-lt]: " NEW_LT_NAME
+  NEW_LT_NAME="${NEW_LT_NAME:-gpu-cb-lt}"
+
+  RESOLVED_AMI=$(resolve_ami "$CB_INSTANCE_TYPE")
 
   if [[ -z "$CB_RESERVATION_ID" ]]; then
     warn "CAPACITY_RESERVATION_ID is empty — template will target 'open' capacity."
-    warn "Set CAPACITY_RESERVATION_ID in config.env after purchasing your Capacity Block."
     CB_CR_SPEC='"CapacityReservationPreference": "open"'
   else
     info "Targeting Capacity Block: $CB_RESERVATION_ID"
     CB_CR_SPEC="\"CapacityReservationPreference\": \"none\", \"CapacityReservationTarget\": { \"CapacityReservationId\": \"${CB_RESERVATION_ID}\" }"
   fi
 
-  # Resolve SG and subnet from config (already validated above)
   RESOLVED_SG="${SECURITY_GROUP_IDS:-}"
   RESOLVED_SUBNET="${SUBNET_ID:-}"
   RESOLVED_PROFILE_ARN="${IAM_INSTANCE_PROFILE:-}"
@@ -1106,16 +1085,15 @@ if [[ "$LT_EXISTS" == false ]]; then
   RESOLVED_PG="${PLACEMENT_GROUP_NAME:-}"
 
   if [[ "$DRY_RUN" == true ]]; then
-    dryrun "ec2 create-launch-template --name $NEW_LT_NAME (instance: $CB_INSTANCE_TYPE, ami: $CB_AMI_ID)"
+    dryrun "ec2 create-launch-template --name $NEW_LT_NAME (instance: $CB_INSTANCE_TYPE, ami: $RESOLVED_AMI)"
     SKIPPED+=("Launch template: dry-run, would create $NEW_LT_NAME")
   else
     LT_FILE="./lt_data_$$.json"
     CLEANUP_FILES+=("$LT_FILE")
 
-    # Build launch template data JSON
     cat > "$LT_FILE" <<EOF
 {
-  "ImageId": "${CB_AMI_ID}",
+  "ImageId": "${RESOLVED_AMI}",
   "InstanceType": "${CB_INSTANCE_TYPE}",
   "KeyName": "${RESOLVED_KEY}",
   "Placement": {
@@ -1168,12 +1146,6 @@ EOF
       --query "LaunchTemplate.LaunchTemplateId")
 
     ok "Launch template '$NEW_LT_NAME' created  (ID: $NEW_LT_ID)"
-    if [[ -z "$CB_RESERVATION_ID" ]]; then
-      warn "Remember to update the template with your Capacity Block ID after purchasing."
-      warn "Run: aws ec2 create-launch-template-version --source-version 1 \\"
-      warn "       --launch-template-id $NEW_LT_ID \\"
-      warn "       --launch-template-data '{\"CapacityReservationSpecification\":{...}}'"
-    fi
     patch_config "LAUNCH_TEMPLATE_NAME" "$NEW_LT_NAME"
     patch_config "LAUNCH_TEMPLATE_ID"   "$NEW_LT_ID"
     CREATED+=("Launch template: $NEW_LT_NAME  ID=$NEW_LT_ID")
@@ -1181,15 +1153,12 @@ EOF
 fi
 
 # =============================================================================
-# 8. FINAL CLOUDWATCH ALARM (optional — capacity block expiry reminder)
+# 8. CLOUDWATCH ALARM
 # =============================================================================
 header "8 / 8  CloudWatch Alarm — Capacity Block Expiry Reminder"
 
-CW_ALARM_NAME="gpu-capacity-block-expiry-reminder"
-EXISTING_ALARM=$(aws_safe ec2 describe-alarms 2>/dev/null || true)
-
-# Only attempt if SNS ARN is known
 if [[ -n "${SNS_ARN:-}" ]]; then
+  CW_ALARM_NAME="gpu-capacity-block-expiry-reminder"
   ALARM_EXISTS=$(aws_cmd cloudwatch describe-alarms \
     --alarm-names "$CW_ALARM_NAME" \
     --query "MetricAlarms[0].AlarmName" 2>/dev/null || true)
@@ -1201,8 +1170,6 @@ if [[ -n "${SNS_ARN:-}" ]]; then
     dryrun "cloudwatch put-metric-alarm --alarm-name $CW_ALARM_NAME"
     SKIPPED+=("CloudWatch alarm: dry-run, would create $CW_ALARM_NAME")
   else
-    # A simple high-CPUCreditBalance alarm is used as a placeholder.
-    # Replace with a custom metric or EventBridge rule based on reservation end time.
     aws_cmd cloudwatch put-metric-alarm \
       --alarm-name "$CW_ALARM_NAME" \
       --alarm-description "Reminder: review GPU Capacity Block reservation status" \
@@ -1241,7 +1208,7 @@ if [[ ${#FOUND[@]} -gt 0 ]]; then
 fi
 
 if [[ ${#CREATED[@]} -gt 0 ]]; then
-  echo -e "\n${CYAN}${BOLD}Created now (${#CREATED[@]}):${NC}"
+  echo -e "\n${CYAN}${BOLD}Created / updated (${#CREATED[@]}):${NC}"
   for item in "${CREATED[@]}"; do echo -e "  ${CYAN}+${NC}  $item"; done
 fi
 

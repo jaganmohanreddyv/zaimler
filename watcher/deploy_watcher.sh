@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # ── Windows Git Bash path fix ─────────────────────────────────────────────────
-# Prevents Git Bash from converting /param/paths to C:/Windows/paths
-# when passing SSM parameter names to the AWS CLI.
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL="*"
 # =============================================================================
 # watcher/deploy_watcher.sh — Deploy all temporary 48-hour watcher services
-# Creates: IAM role, Lambda functions, DynamoDB, API Gateway, Step Functions,
-#          EventBridge Scheduler
-# All resources tagged CreatedBy=watcher for safe cleanup
+#
+# CHANGES FROM ORIGINAL:
+#   - Step Functions definition simplified:
+#       Removed: SendAZEmails, WaitForApproval, RouteApproval, SendReminder
+#       Added:   SendCapacityFoundEmail, WaitForProceed, CheckProceedResult,
+#                WaitForConfirm, CheckConfirmResult
+#   - New flow:
+#       RunDiscovery → found → SendCapacityFoundEmail → WaitForProceed (4h)
+#                   → CheckProceedResult → proceed → PipelineApproved
+#                                        → cancelled → CleanupAndExit
+#                                        → pending → WaitForNextRetry (scan continues)
+#       RunDiscovery → not found → WaitForNextRetry (15 min) → RunDiscovery
+#       RunDiscovery → timeout → Send48HourEmail → WaitForRetryOrQuit (4h)
+#                   → retry → ResetAndRetry → RunDiscovery
+#                   → quit  → CleanupAndExit
 # =============================================================================
 
 set -euo pipefail
@@ -17,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG_FILE="${ROOT_DIR}/config.env"
 
-# Parse arguments
+# ── Parse arguments ───────────────────────────────────────────────────────────
 DRY_RUN=false
 COMBINATIONS=""
 INSTANCE_COUNT="1"
@@ -83,9 +93,10 @@ patch_config() {
 }
 
 if [[ "$DRY_RUN" == true ]]; then
-  dryrun "Would deploy: Lambda role, 4 Lambdas, DynamoDB, API Gateway, Step Functions, EventBridge"
+  dryrun "Would deploy: Lambda role, 4 Lambdas, DynamoDB, API Gateway, Step Functions"
   dryrun "Pipeline Run ID would be: $PIPELINE_RUN_ID"
   dryrun "Combinations: $COMBINATIONS"
+  dryrun "New simplified Step Functions flow (single PROCEED email, no per-AZ YES/NO/WAIT)"
   exit 0
 fi
 
@@ -116,19 +127,26 @@ put_param "reserve-script"    "${ROOT_DIR}/reserve.sh"
 put_param "launch-script"     "${ROOT_DIR}/launch.sh"
 put_param "monitor-script"    "${ROOT_DIR}/monitor.sh"
 put_param "aws-region"        "$AWS_REGION"
-# Build SNS ARN if not set in config.env — aws_check_create.sh saves
-  # SNS_TOPIC_NAME but not the full ARN. Construct it here.
-  RESOLVED_SNS_ARN="${SNS_TOPIC_ARN:-}"
-  if [[ -z "$RESOLVED_SNS_ARN" && -n "${SNS_TOPIC_NAME:-}" ]]; then
-    RESOLVED_SNS_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
-    info "SNS ARN constructed: $RESOLVED_SNS_ARN"
-  fi
-  put_param "sns-topic-arn" "$RESOLVED_SNS_ARN"
+
+RESOLVED_SNS_ARN="${SNS_TOPIC_ARN:-}"
+if [[ -z "$RESOLVED_SNS_ARN" && -n "${SNS_TOPIC_NAME:-}" ]]; then
+  RESOLVED_SNS_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"
+  info "SNS ARN constructed: $RESOLVED_SNS_ARN"
+fi
+put_param "sns-topic-arn"     "$RESOLVED_SNS_ARN"
 put_param "cleanup-table"     "$TABLE_NAME"
 put_param "cleanup-schedule"  "$SCHEDULE_NAME"
 put_param "cleanup-apigw"     "$APIGW_NAME"
 put_param "cleanup-sm-name"   "$SM_NAME"
 put_param "cleanup-role-name" "$LAMBDA_ROLE_NAME"
+
+# Initialise approval + control signals to empty
+put_param "approval-decision"   ""
+put_param "retry-quit-decision" ""
+put_param "control-decision"    ""
+put_param "proceed-token"       ""
+put_param "found-offerings"     ""
+put_param "selected-offering"   ""
 
 ok "Pipeline config saved to SSM: $SSM_PREFIX"
 
@@ -144,7 +162,7 @@ LAMBDA_ROLE_ARN=$(aws $PROFILE_FLAG iam create-role \
   --tags Key=CreatedBy,Value=watcher Key=PipelineRunId,Value="$PIPELINE_RUN_ID" \
   --query "Role.Arn" --output text)
 
-LAMBDA_PERMS_JSON='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:DescribeCapacityBlockOfferings","ec2:DescribeCapacityReservations","sagemaker:SearchTrainingPlanOfferings","dynamodb:PutItem","dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:Scan","dynamodb:DeleteTable","dynamodb:DescribeTable","ssm:GetParameter","ssm:PutParameter","sns:Publish","scheduler:DeleteSchedule","apigateway:DELETE","states:StopExecution","states:DeleteStateMachine","lambda:DeleteFunction","lambda:InvokeFunction","iam:DetachRolePolicy","iam:DeleteRole","iam:DeleteRolePolicy","cloudwatch:DeleteAlarms","logs:DeleteLogGroup"],"Resource":"*"}]}'
+LAMBDA_PERMS_JSON='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:DescribeCapacityBlockOfferings","ec2:DescribeCapacityReservations","sagemaker:SearchTrainingPlanOfferings","dynamodb:PutItem","dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:Scan","dynamodb:DeleteTable","dynamodb:DescribeTable","ssm:GetParameter","ssm:PutParameter","ssm:GetParametersByPath","ssm:DeleteParameters","sns:Publish","scheduler:DeleteSchedule","apigateway:DELETE","states:StopExecution","states:DeleteStateMachine","lambda:DeleteFunction","lambda:InvokeFunction","iam:DetachRolePolicy","iam:DeleteRole","iam:DeleteRolePolicy","iam:ListRolePolicies","iam:ListAttachedRolePolicies","cloudwatch:DeleteAlarms","logs:DeleteLogGroup","ec2:DeleteKeyPair","ec2:DeleteSubnet","ec2:DeleteSecurityGroup","ec2:DeletePlacementGroup","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","ec2:DescribePlacementGroups","ec2:DescribeKeyPairs","ec2:DeleteLaunchTemplate","ec2:DescribeLaunchTemplates","iam:DeleteInstanceProfile","iam:RemoveRoleFromInstanceProfile","iam:GetInstanceProfile","iam:DetachUserPolicy","iam:DeletePolicy","iam:ListPolicyVersions","iam:DeletePolicyVersion","iam:GetPolicy","sns:DeleteTopic","sns:ListSubscriptionsByTopic","sns:Unsubscribe","sns:ListTopics","cloudwatch:DescribeAlarms"],"Resource":"*"}]}'
 
 aws $PROFILE_FLAG iam put-role-policy \
   --role-name "$LAMBDA_ROLE_NAME" \
@@ -152,7 +170,7 @@ aws $PROFILE_FLAG iam put-role-policy \
   --policy-document "$LAMBDA_PERMS_JSON" > /dev/null
 
 ok "Lambda role created: $LAMBDA_ROLE_ARN"
-put_param "lambda-role-arn" "$LAMBDA_ROLE_ARN"
+put_param "lambda-role-arn"          "$LAMBDA_ROLE_ARN"
 put_param "cleanup-lambda-role-name" "$LAMBDA_ROLE_NAME"
 
 info "Waiting 15 seconds for IAM role to propagate..."
@@ -166,13 +184,10 @@ deploy_lambda() {
   local SOURCE_FILE="$2"
   local HANDLER="$3"
 
-  local SRC_DIR; SRC_DIR="$(dirname "$SOURCE_FILE")"
+  local SRC_DIR;  SRC_DIR="$(dirname  "$SOURCE_FILE")"
   local SRC_BASE; SRC_BASE="$(basename "$SOURCE_FILE")"
   local ZIP_NAME="${FUNC_NAME}_deploy.zip"
 
-  # Use Python to create ZIP — zip command not available on Windows Git Bash
-  # pushd into source dir so the ZIP is created with a relative path,
-  # then use fileb://./name.zip — relative paths bypass MSYS path conversion
   pushd "$SRC_DIR" > /dev/null
   python3 -c "
 import zipfile
@@ -181,7 +196,6 @@ with zipfile.ZipFile('${ZIP_NAME}', 'w', zipfile.ZIP_DEFLATED) as zf:
 print('ZIP created: ${ZIP_NAME}')
 " || { fail "Failed to create ZIP for $FUNC_NAME"; popd > /dev/null; return 1; }
 
-  # Check if Lambda already exists
   if aws $PROFILE_FLAG lambda get-function \
       --function-name "$FUNC_NAME" \
       --region "$AWS_REGION" > /dev/null 2>&1; then
@@ -205,12 +219,11 @@ print('ZIP created: ${ZIP_NAME}')
 
   rm -f "$ZIP_NAME"
   popd > /dev/null
-
   ok "Lambda deployed: $FUNC_NAME"
   put_param "lambda-${FUNC_NAME}" "$FUNC_NAME"
 }
 
-# Discovery Lambda — single file, calls EC2 API directly, no external deps
+# Discovery Lambda
 DISCO_NAME="gpu-watcher-discovery-${PIPELINE_RUN_ID}"
 DISCO_ZIP="${DISCO_NAME}_deploy.zip"
 pushd "${SCRIPT_DIR}" > /dev/null
@@ -237,7 +250,7 @@ else
 fi
 rm -f "$DISCO_ZIP"
 popd > /dev/null
-ok "Lambda deployed: $DISCO_NAME (direct EC2 API — no app.py, no pandas)"
+ok "Lambda deployed: $DISCO_NAME"
 put_param "lambda-${DISCO_NAME}" "$DISCO_NAME"
 
 deploy_lambda "gpu-watcher-notify-${PIPELINE_RUN_ID}" \
@@ -271,23 +284,22 @@ aws $PROFILE_FLAG dynamodb wait table-exists \
   --region "$AWS_REGION" \
   --table-name "$TABLE_NAME"
 
-# Seed initial state
 aws $PROFILE_FLAG dynamodb put-item \
   --region "$AWS_REGION" \
   --table-name "$TABLE_NAME" \
   --item "{
-    \"pk\": {\"S\": \"watcher-state\"},
-    \"status\": {\"S\": \"running\"},
+    \"pk\":           {\"S\": \"watcher-state\"},
+    \"status\":       {\"S\": \"running\"},
     \"attemptCount\": {\"N\": \"0\"},
-    \"maxAttempts\": {\"N\": \"$(( MAX_HOURS * 60 / RETRY_MINS ))\"},
-    \"startTime\": {\"S\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"},
-    \"maxHours\": {\"N\": \"${MAX_HOURS}\"},
-    \"pipelineRunId\": {\"S\": \"${PIPELINE_RUN_ID}\"}
+    \"maxAttempts\":  {\"N\": \"$(( MAX_HOURS * 60 / RETRY_MINS ))\"},
+    \"startTime\":    {\"S\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"},
+    \"maxHours\":     {\"N\": \"${MAX_HOURS}\"},
+    \"pipelineRunId\":{\"S\": \"${PIPELINE_RUN_ID}\"}
   }" > /dev/null
 
 ok "DynamoDB table created: $TABLE_NAME"
 
-# ── Step 5: Create API Gateway for approval links ─────────────────────────────
+# ── Step 5: Create API Gateway ────────────────────────────────────────────────
 header "5 / 8  Creating API Gateway approval endpoint"
 
 APIGW_ID=$(aws $PROFILE_FLAG apigateway create-rest-api \
@@ -302,7 +314,6 @@ ROOT_RESOURCE_ID=$(aws $PROFILE_FLAG apigateway get-resources \
   --rest-api-id "$APIGW_ID" \
   --query "items[?path=='/'].id" --output text)
 
-# Create /approve resource
 APPROVE_RESOURCE_ID=$(aws $PROFILE_FLAG apigateway create-resource \
   --region "$AWS_REGION" \
   --rest-api-id "$APIGW_ID" \
@@ -310,7 +321,6 @@ APPROVE_RESOURCE_ID=$(aws $PROFILE_FLAG apigateway create-resource \
   --path-part "approve" \
   --query "id" --output text)
 
-# Create GET method
 aws $PROFILE_FLAG apigateway put-method \
   --region "$AWS_REGION" \
   --rest-api-id "$APIGW_ID" \
@@ -340,9 +350,8 @@ aws $PROFILE_FLAG apigateway create-deployment \
 
 API_URL="https://${APIGW_ID}.execute-api.${AWS_REGION}.amazonaws.com/prod"
 put_param "api-gateway-url" "$API_URL"
-put_param "api-gateway-id" "$APIGW_ID"
+put_param "api-gateway-id"  "$APIGW_ID"
 
-# Give API Gateway permission to invoke Lambda
 aws $PROFILE_FLAG lambda add-permission \
   --region "$AWS_REGION" \
   --function-name "gpu-watcher-approve-${PIPELINE_RUN_ID}" \
@@ -391,11 +400,246 @@ CLEANUP_ARN=$(aws $PROFILE_FLAG lambda get-function \
   --function-name "gpu-watcher-cleanup-${PIPELINE_RUN_ID}" \
   --query "Configuration.FunctionArn" --output text)
 
-
 RETRY_MINS_SECS=$((RETRY_MINS * 60))
+# 4 hours in seconds for approval waits
+APPROVAL_WAIT_SECS=14400
 
-# Build state machine definition inline — no temp files (Windows Git Bash compatible)
-SM_DEFINITION="{\"Comment\":\"GPU Capacity Block 48-hour watcher pipeline\",\"StartAt\":\"RunDiscovery\",\"States\":{\"RunDiscovery\":{\"Type\":\"Task\",\"Resource\":\"${DISCOVERY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"discover\"},\"ResultPath\":\"$.discoveryResult\",\"Next\":\"CheckDiscoveryResult\",\"Catch\":[{\"ErrorEquals\":[\"States.ALL\"],\"Next\":\"DiscoveryFailed\"}]},\"CheckDiscoveryResult\":{\"Type\":\"Choice\",\"Choices\":[{\"Variable\":\"$.discoveryResult.found\",\"BooleanEquals\":true,\"Next\":\"SendAZEmails\"},{\"Variable\":\"$.discoveryResult.timeout\",\"BooleanEquals\":true,\"Next\":\"Send48HourEmail\"}],\"Default\":\"WaitForNextRetry\"},\"WaitForNextRetry\":{\"Type\":\"Wait\",\"Seconds\":${RETRY_MINS_SECS},\"Next\":\"RunDiscovery\"},\"SendAZEmails\":{\"Type\":\"Task\",\"Resource\":\"${NOTIFY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"notify_found\"},\"ResultPath\":\"$.notifyResult\",\"Next\":\"WaitForApproval\",\"Catch\":[{\"ErrorEquals\":[\"States.ALL\"],\"Next\":\"CleanupAndExit\"}]},\"WaitForApproval\":{\"Type\":\"Wait\",\"Seconds\":14400,\"Next\":\"CheckApprovalResult\"},\"CheckApprovalResult\":{\"Type\":\"Task\",\"Resource\":\"${DISCOVERY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"check_approval\"},\"ResultPath\":\"$.approvalResult\",\"Next\":\"RouteApproval\"},\"RouteApproval\":{\"Type\":\"Choice\",\"Choices\":[{\"Variable\":\"$.approvalResult.decision\",\"StringEquals\":\"confirmed\",\"Next\":\"PipelineApproved\"},{\"Variable\":\"$.approvalResult.decision\",\"StringEquals\":\"cancelled\",\"Next\":\"CleanupAndExit\"},{\"Variable\":\"$.approvalResult.decision\",\"StringEquals\":\"wait\",\"Next\":\"RunDiscovery\"}],\"Default\":\"SendReminder\"},\"SendReminder\":{\"Type\":\"Task\",\"Resource\":\"${NOTIFY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"send_reminder\"},\"Next\":\"WaitForApproval\"},\"PipelineApproved\":{\"Type\":\"Pass\",\"Result\":\"approved\",\"End\":true},\"Send48HourEmail\":{\"Type\":\"Task\",\"Resource\":\"${NOTIFY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"notify_timeout\"},\"ResultPath\":\"$.timeoutResult\",\"Next\":\"WaitForRetryOrQuit\"},\"WaitForRetryOrQuit\":{\"Type\":\"Wait\",\"Seconds\":14400,\"Next\":\"CheckRetryOrQuit\"},\"CheckRetryOrQuit\":{\"Type\":\"Task\",\"Resource\":\"${DISCOVERY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"check_retry_quit\"},\"ResultPath\":\"$.retryResult\",\"Next\":\"RouteRetryOrQuit\"},\"RouteRetryOrQuit\":{\"Type\":\"Choice\",\"Choices\":[{\"Variable\":\"$.retryResult.decision\",\"StringEquals\":\"retry\",\"Next\":\"ResetAndRetry\"},{\"Variable\":\"$.retryResult.decision\",\"StringEquals\":\"quit\",\"Next\":\"CleanupAndExit\"}],\"Default\":\"CleanupAndExit\"},\"ResetAndRetry\":{\"Type\":\"Task\",\"Resource\":\"${DISCOVERY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"reset_watcher\"},\"Next\":\"RunDiscovery\"},\"CleanupAndExit\":{\"Type\":\"Task\",\"Resource\":\"${CLEANUP_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"reason\":\"user_exit\"},\"End\":true},\"DiscoveryFailed\":{\"Type\":\"Task\",\"Resource\":\"${NOTIFY_ARN}\",\"Parameters\":{\"pipelineRunId\":\"${PIPELINE_RUN_ID}\",\"action\":\"notify_error\"},\"Next\":\"CleanupAndExit\"}}}" 
+# =============================================================================
+# UPDATED Step Functions definition
+#
+# OLD states removed:
+#   SendAZEmails, WaitForApproval, RouteApproval, SendReminder
+#
+# NEW states:
+#   SendCapacityFoundEmail — triggers notify Lambda (single PROCEED email)
+#   WaitForProceed         — waits up to 4h for user to click PROCEED
+#   CheckProceedResult     — polls SSM for approval-decision
+#   RouteProceed           — routes on proceed / cancelled / pending
+#   WaitForConfirm         — waits up to 30min for CONFIRM PURCHASE click
+#   CheckConfirmResult     — polls SSM for confirmed / cancelled / pending
+#   RouteConfirm           — routes on confirmed / cancelled / pending
+#
+# NOT found path — unchanged:
+#   WaitForNextRetry → RunDiscovery (loops every 15 min)
+#
+# Timeout path — unchanged:
+#   Send48HourEmail → WaitForRetryOrQuit → CheckRetryOrQuit → route
+# =============================================================================
+
+SM_DEFINITION="{
+  \"Comment\": \"GPU Capacity Block 48-hour watcher — simplified approval flow\",
+  \"StartAt\": \"RunDiscovery\",
+  \"States\": {
+
+    \"RunDiscovery\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${DISCOVERY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"discover\"
+      },
+      \"ResultPath\": \"$.discoveryResult\",
+      \"Next\": \"CheckDiscoveryResult\",
+      \"Catch\": [{
+        \"ErrorEquals\": [\"States.ALL\"],
+        \"Next\": \"DiscoveryFailed\"
+      }]
+    },
+
+    \"CheckDiscoveryResult\": {
+      \"Type\": \"Choice\",
+      \"Choices\": [
+        {
+          \"Variable\": \"$.discoveryResult.found\",
+          \"BooleanEquals\": true,
+          \"Next\": \"SendCapacityFoundEmail\"
+        },
+        {
+          \"Variable\": \"$.discoveryResult.timeout\",
+          \"BooleanEquals\": true,
+          \"Next\": \"Send48HourEmail\"
+        }
+      ],
+      \"Default\": \"WaitForNextRetry\"
+    },
+
+    \"WaitForNextRetry\": {
+      \"Type\": \"Wait\",
+      \"Seconds\": ${RETRY_MINS_SECS},
+      \"Next\": \"RunDiscovery\"
+    },
+
+    \"SendCapacityFoundEmail\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${NOTIFY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"notify_found\"
+      },
+      \"ResultPath\": \"$.notifyResult\",
+      \"Next\": \"WaitForProceed\",
+      \"Catch\": [{
+        \"ErrorEquals\": [\"States.ALL\"],
+        \"Next\": \"DiscoveryFailed\"
+      }]
+    },
+
+    \"WaitForProceed\": {
+      \"Type\": \"Wait\",
+      \"Seconds\": ${APPROVAL_WAIT_SECS},
+      \"Next\": \"CheckProceedResult\"
+    },
+
+    \"CheckProceedResult\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${DISCOVERY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"check_approval\"
+      },
+      \"ResultPath\": \"$.proceedResult\",
+      \"Next\": \"RouteProceed\"
+    },
+
+    \"RouteProceed\": {
+      \"Type\": \"Choice\",
+      \"Choices\": [
+        {
+          \"Variable\": \"$.proceedResult.decision\",
+          \"StringEquals\": \"proceed\",
+          \"Next\": \"WaitForConfirm\"
+        },
+        {
+          \"Variable\": \"$.proceedResult.decision\",
+          \"StringEquals\": \"confirmed\",
+          \"Next\": \"PipelineApproved\"
+        },
+        {
+          \"Variable\": \"$.proceedResult.decision\",
+          \"StringEquals\": \"cancelled\",
+          \"Next\": \"CleanupAndExit\"
+        }
+      ],
+      \"Default\": \"WaitForNextRetry\"
+    },
+
+    \"WaitForConfirm\": {
+      \"Type\": \"Wait\",
+      \"Seconds\": 1800,
+      \"Next\": \"CheckConfirmResult\"
+    },
+
+    \"CheckConfirmResult\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${DISCOVERY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"check_approval\"
+      },
+      \"ResultPath\": \"$.confirmResult\",
+      \"Next\": \"RouteConfirm\"
+    },
+
+    \"RouteConfirm\": {
+      \"Type\": \"Choice\",
+      \"Choices\": [
+        {
+          \"Variable\": \"$.confirmResult.decision\",
+          \"StringEquals\": \"confirmed\",
+          \"Next\": \"PipelineApproved\"
+        },
+        {
+          \"Variable\": \"$.confirmResult.decision\",
+          \"StringEquals\": \"cancelled\",
+          \"Next\": \"CleanupAndExit\"
+        }
+      ],
+      \"Default\": \"WaitForConfirm\"
+    },
+
+    \"PipelineApproved\": {
+      \"Type\": \"Pass\",
+      \"Result\": \"approved\",
+      \"End\": true
+    },
+
+    \"Send48HourEmail\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${NOTIFY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"notify_timeout\"
+      },
+      \"ResultPath\": \"$.timeoutResult\",
+      \"Next\": \"WaitForRetryOrQuit\"
+    },
+
+    \"WaitForRetryOrQuit\": {
+      \"Type\": \"Wait\",
+      \"Seconds\": ${APPROVAL_WAIT_SECS},
+      \"Next\": \"CheckRetryOrQuit\"
+    },
+
+    \"CheckRetryOrQuit\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${DISCOVERY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"check_retry_quit\"
+      },
+      \"ResultPath\": \"$.retryResult\",
+      \"Next\": \"RouteRetryOrQuit\"
+    },
+
+    \"RouteRetryOrQuit\": {
+      \"Type\": \"Choice\",
+      \"Choices\": [
+        {
+          \"Variable\": \"$.retryResult.decision\",
+          \"StringEquals\": \"retry\",
+          \"Next\": \"ResetAndRetry\"
+        },
+        {
+          \"Variable\": \"$.retryResult.decision\",
+          \"StringEquals\": \"quit\",
+          \"Next\": \"CleanupAndExit\"
+        }
+      ],
+      \"Default\": \"CleanupAndExit\"
+    },
+
+    \"ResetAndRetry\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${DISCOVERY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"reset_watcher\"
+      },
+      \"Next\": \"RunDiscovery\"
+    },
+
+    \"CleanupAndExit\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${CLEANUP_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"reason\": \"user_exit\"
+      },
+      \"End\": true
+    },
+
+    \"DiscoveryFailed\": {
+      \"Type\": \"Task\",
+      \"Resource\": \"${NOTIFY_ARN}\",
+      \"Parameters\": {
+        \"pipelineRunId\": \"${PIPELINE_RUN_ID}\",
+        \"action\": \"notify_error\"
+      },
+      \"Next\": \"CleanupAndExit\"
+    }
+
+  }
+}"
 
 SM_ARN=$(aws $PROFILE_FLAG stepfunctions create-state-machine \
   --region "$AWS_REGION" \
@@ -408,7 +652,7 @@ SM_ARN=$(aws $PROFILE_FLAG stepfunctions create-state-machine \
 ok "Step Functions state machine created: $SM_ARN"
 put_param "state-machine-arn" "$SM_ARN"
 
-# ── Step 7: Start Step Functions execution ────────────────────────────────────
+# ── Step 7: Start execution ───────────────────────────────────────────────────
 header "7 / 8  Starting Step Functions execution"
 
 EXECUTION_ARN=$(aws $PROFILE_FLAG stepfunctions start-execution \
@@ -421,13 +665,13 @@ EXECUTION_ARN=$(aws $PROFILE_FLAG stepfunctions start-execution \
 ok "Execution started: $EXECUTION_ARN"
 put_param "execution-arn" "$EXECUTION_ARN"
 
-# ── Step 8: Patch config.env and print summary ────────────────────────────────
-header "8 / 8  Saving watcher details"
+# ── Step 8: Save watcher details ──────────────────────────────────────────────
+header "8 / 8  Saving watcher details to config.env"
 
 patch_config "WATCHER_STATE_MACHINE_ARN" "$SM_ARN"
-patch_config "WATCHER_DYNAMODB_TABLE" "$TABLE_NAME"
-patch_config "WATCHER_API_GATEWAY_URL" "$API_URL"
-patch_config "WATCHER_LAMBDA_ROLE_ARN" "$LAMBDA_ROLE_ARN"
+patch_config "WATCHER_DYNAMODB_TABLE"    "$TABLE_NAME"
+patch_config "WATCHER_API_GATEWAY_URL"   "$API_URL"
+patch_config "WATCHER_LAMBDA_ROLE_ARN"   "$LAMBDA_ROLE_ARN"
 
 echo ""
 ok "All watcher services deployed"
@@ -438,4 +682,10 @@ info "DynamoDB Table  : $TABLE_NAME"
 info "API Gateway     : $API_URL"
 info "SSM Prefix      : $SSM_PREFIX"
 echo ""
+info "New email flow:"
+info "  Capacity found  →  single email with PROCEED link"
+info "  PROCEED clicked →  final confirmation email (CONFIRM / CANCEL)"
+info "  CONFIRM clicked →  purchase + launch"
+info "  Ignore email    →  scan continues automatically every ${RETRY_MINS} min"
+info ""
 info "Monitor at: AWS Console → Step Functions → $SM_NAME"

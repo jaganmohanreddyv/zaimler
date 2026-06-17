@@ -1,14 +1,12 @@
 """
-lambda_discovery.py — GPU Watcher Discovery Lambda
+lambda_discovery.py — GPU Watcher Discovery Lambda  (updated)
 Called by Step Functions every 15 minutes.
 
-Calls the EC2 describe_capacity_block_offerings API directly.
-The three functions (scan_region, run_parallel, process_results) are
-inlined from the official AWS capacity finder app.py so we never need
-to import that file (it executes Streamlit UI code at module level
-which crashes in a Lambda environment).
-
-Zero external dependencies beyond boto3 (pre-installed in Lambda).
+CHANGES FROM ORIGINAL:
+  - Removed multi-AZ YES/WAIT/NO token system
+  - check_approval now only checks for 'proceed' signal (user clicked PROCEED)
+  - After capacity found, single email is sent and pipeline waits for proceed
+  - All other logic (timeout, retry/quit, reset) unchanged
 """
 
 import os
@@ -24,13 +22,13 @@ SSM_PREFIX  = os.environ.get("SSM_PREFIX", "")
 TABLE_NAME  = os.environ.get("TABLE_NAME", "")
 PIPELINE_ID = os.environ.get("PIPELINE_RUN_ID", "")
 
-ssm    = boto3.client("ssm",      region_name=AWS_REGION)
+ssm    = boto3.client("ssm",       region_name=AWS_REGION)
 dynamo = boto3.resource("dynamodb", region_name=AWS_REGION)
 
 MAX_WORKERS = 8
 
 # ---------------------------------------------------------------------------
-# Helpers — SSM / DynamoDB
+# SSM / DynamoDB helpers
 # ---------------------------------------------------------------------------
 
 def get_param(key: str) -> str:
@@ -58,7 +56,7 @@ def invoke_notify(action: str, extra: dict = None) -> None:
             payload.update(extra)
         lmb.invoke(
             FunctionName=f"gpu-watcher-notify-{PIPELINE_ID}",
-            InvocationType="Event",  # async — don't wait for response
+            InvocationType="Event",
             Payload=json.dumps(payload).encode(),
         )
         print(f"[lambda_discovery] Invoked notify action={action}")
@@ -73,9 +71,9 @@ def get_state() -> dict:
         return {}
 
 def update_state(**kwargs) -> None:
-    update_expr = "SET " + ", ".join(f"#{k}=:{k}" for k in kwargs)
-    expr_names  = {f"#{k}": k for k in kwargs}
-    expr_values = {f":{k}": v for k, v in kwargs.items()}
+    update_expr  = "SET " + ", ".join(f"#{k}=:{k}" for k in kwargs)
+    expr_names   = {f"#{k}": k for k in kwargs}
+    expr_values  = {f":{k}": v for k, v in kwargs.items()}
     get_table().update_item(
         Key={"pk": "watcher-state"},
         UpdateExpression=update_expr,
@@ -96,7 +94,6 @@ def log_msg(msg, region=None, instance_type=None):
     print(f"[{' | '.join(parts)}] {msg}")
 
 def parse_iso_date(date_val):
-    """Convert AWS string/datetime to datetime."""
     if isinstance(date_val, str):
         if date_val.endswith("Z"):
             return datetime.fromisoformat(date_val.replace("Z", "+00:00"))
@@ -105,45 +102,40 @@ def parse_iso_date(date_val):
 
 def scan_region(region: str, itype: str, count: int, duration: int,
                 start_dt: date, end_dt=None, use_end_date: bool = False) -> list:
-    """
-    Call EC2 describe_capacity_block_offerings for one region+instance_type.
-    Returns a list of result dicts (or a single-item list with an Error key).
-    Inlined from app.py scan_region() — identical logic, no Streamlit globals.
-    """
     try:
         ec2 = boto3.client("ec2", region_name=region)
         params = {
-            "InstanceType":           itype,
-            "InstanceCount":          int(count),
-            "CapacityDurationHours":  int(duration * 24),
-            "StartDateRange":         datetime.combine(start_dt, datetime.min.time()),
-            "MaxResults":             100,
+            "InstanceType":          itype,
+            "InstanceCount":         int(count),
+            "CapacityDurationHours": int(duration * 24),
+            "StartDateRange":        datetime.combine(start_dt, datetime.min.time()),
+            "MaxResults":            100,
         }
         if use_end_date and end_dt:
             params["EndDateRange"] = datetime.combine(end_dt, datetime.min.time())
 
         log_msg(f"EC2 params: {params}", region, itype)
         resp = ec2.describe_capacity_block_offerings(**params)
-        log_msg(f"EC2 response: {len(resp.get('CapacityBlockOfferings', []))} offerings", region, itype)
+        log_msg(f"EC2 response: {len(resp.get('CapacityBlockOfferings', []))} offerings",
+                region, itype)
 
         results = []
         for o in resp.get("CapacityBlockOfferings", []):
             s_dt = parse_iso_date(o["StartDate"])
             e_dt = parse_iso_date(o["EndDate"])
-            upfront_fee   = f"${o.get('UpfrontFee', '0')}"
-            duration_hrs  = o["CapacityBlockDurationHours"]
-            reserved      = o.get("ReservedCapacityOfferings", [{}]) or [{}]
-            parts_count   = len(reserved)
+            upfront_fee  = f"${o.get('UpfrontFee', '0')}"
+            duration_hrs = o["CapacityBlockDurationHours"]
+            reserved     = o.get("ReservedCapacityOfferings", [{}]) or [{}]
             results.append({
-                "Region":           region,
-                "Instance Type":    itype,
-                "Instance Count":   str(o.get("InstanceCount", 0)),
-                "Duration (days)":  f"{duration_hrs / 24:.2f}",
-                "Start Date":       s_dt.strftime("%d/%m/%Y %H:%M"),
-                "End Date":         e_dt.strftime("%d/%m/%Y %H:%M"),
-                "Upfront Fee":      upfront_fee,
-                "Number of Parts":  str(parts_count),
-                "Availability Zone": o.get("AvailabilityZone", "N/A"),
+                "Region":                  region,
+                "Instance Type":           itype,
+                "Instance Count":          str(o.get("InstanceCount", 0)),
+                "Duration (days)":         f"{duration_hrs / 24:.2f}",
+                "Start Date":              s_dt.strftime("%d/%m/%Y %H:%M"),
+                "End Date":                e_dt.strftime("%d/%m/%Y %H:%M"),
+                "Upfront Fee":             upfront_fee,
+                "Number of Parts":         str(len(reserved)),
+                "Availability Zone":       o.get("AvailabilityZone", "N/A"),
                 "CapacityBlockOfferingId": o.get("CapacityBlockOfferingId", ""),
             })
         return results
@@ -153,7 +145,6 @@ def scan_region(region: str, itype: str, count: int, duration: int,
 def run_parallel(regions: list, instance_types: list, count: int,
                  duration: int, start_dt: date,
                  end_dt=None, use_end_date: bool = False) -> list:
-    """Run scan_region in parallel across all region+type combinations."""
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [
@@ -170,10 +161,6 @@ def run_parallel(regions: list, instance_types: list, count: int,
     return results
 
 def process_results(raw: list) -> tuple:
-    """
-    Split raw results into (successes, errors).
-    Returns two plain lists of dicts — no pandas dependency.
-    """
     successes = [r for r in raw if "Error" not in r]
     errors    = [r for r in raw if "Error" in r]
     return successes, errors
@@ -183,7 +170,6 @@ def process_results(raw: list) -> tuple:
 # ---------------------------------------------------------------------------
 
 def parse_combinations(combo_str: str) -> list:
-    """Parse 'TYPE|REGION|AZ;TYPE|REGION|AZ' into list of dicts."""
     combos = []
     for item in combo_str.split(";"):
         parts = item.strip().split("|")
@@ -196,7 +182,6 @@ def parse_combinations(combo_str: str) -> list:
     return combos
 
 def filter_by_az(results: list, combinations: list) -> list:
-    """Keep only results whose (type, region, AZ) match a requested combination."""
     requested = {
         (c["instance_type"], c["region"], c["az"])
         for c in combinations
@@ -235,14 +220,16 @@ def handler(event: dict, context) -> dict:
     print(f"[lambda_discovery] action={action} pipeline={pipeline_run_id}")
 
     # ── check_approval ───────────────────────────────────────────────────────
+    # UPDATED: simplified — only checks for 'proceed' signal.
+    # Old YES/WAIT/NO multi-token logic removed.
     if action == "check_approval":
         approval = get_param("approval-decision")
-        if approval == "confirmed":
-            return {"decision": "confirmed"}
-        if approval in ("cancelled", "no"):
+        print(f"[lambda_discovery] check_approval → decision={approval}")
+        if approval == "proceed":
+            return {"decision": "proceed"}
+        if approval == "cancelled":
             return {"decision": "cancelled"}
-        if approval == "wait":
-            return {"decision": "wait"}
+        # No response yet — keep waiting
         return {"decision": "pending"}
 
     # ── check_retry_quit ─────────────────────────────────────────────────────
@@ -263,6 +250,7 @@ def handler(event: dict, context) -> dict:
         )
         put_param("retry-quit-decision", "")
         put_param("approval-decision",   "")
+        put_param("found-offerings",     "")
         invoke_notify("notify_retry_started")
         return {"reset": True}
 
@@ -272,9 +260,10 @@ def handler(event: dict, context) -> dict:
     max_attempts = int(state.get("maxAttempts",  192))
     max_hours    = int(state.get("maxHours",     48))
 
+    # Check timeout
     if check_timeout(state, max_hours) or attempt >= max_attempts:
         update_state(status="timeout", attemptCount=Decimal(str(attempt)))
-        print(f"[lambda_discovery] 48-hour window expired after {attempt} attempts")
+        print(f"[lambda_discovery] 48h window expired after {attempt} attempts")
         return {"found": False, "timeout": True, "attempts": attempt}
 
     combo_str      = get_param("combinations")
@@ -318,14 +307,18 @@ def handler(event: dict, context) -> dict:
               + "; ".join(e.get("Error", "") for e in errors[:3]))
 
     if filtered:
+        # Store all found offerings
         put_param("found-offerings", json.dumps(filtered))
-        print(f"[lambda_discovery] Found {len(filtered)} offering(s)")
+        # Store the best offering (first result) ready for reservation
+        put_param("selected-offering", json.dumps(filtered[0], default=str))
+        print(f"[lambda_discovery] Found {len(filtered)} offering(s) — "
+              f"sending capacity found email")
         return {"found": True, "timeout": False,
                 "offerings": filtered, "attempts": attempt}
 
     print(f"[lambda_discovery] Nothing found. attempt={attempt}/{max_attempts}")
 
-    # Send heartbeat email so user knows the scan is running
+    # Send heartbeat email every scan
     invoke_notify("scan_heartbeat", {
         "attempt":     attempt,
         "maxAttempts": max_attempts,

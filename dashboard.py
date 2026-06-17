@@ -313,6 +313,6 @@ with st.expander("Watcher services (temporary — deleted on exit)"):
 st.markdown("---")
 st.caption(
     "Dashboard auto-refreshes every 30 seconds. "
-    "All pipeline decisions (YES / NO / WAIT / CONFIRM) are made through email links only. "
+    "All pipeline decisions (PROCEED / CONFIRM PURCHASE / CANCEL) are made through email links only. "
     "This dashboard is read-only."
 )
