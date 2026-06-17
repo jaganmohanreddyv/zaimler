@@ -1,19 +1,32 @@
 """
-lambda_approve.py — GPU Watcher Approval Handler Lambda  (updated)
+lambda_approve.py — GPU Watcher Approval Handler (multi-AZ)
 
-CHANGES FROM ORIGINAL:
-  - Removed YES / WAIT / NO per-AZ token handlers
-  - Removed invalidate_all_other_tokens()
-  - Added 'proceed' decision handler — validates proceed token,
-    writes approval-decision=proceed to SSM, triggers final confirmation email
-  - CONFIRM / CANCEL final confirmation handlers unchanged
-  - RETRY / QUIT timeout handlers unchanged
-  - Added STOP / STOP_TERMINATE / RESTART control handlers (new feature)
+MULTI-AZ FLOW:
+  PROCEED on AZ-N email:
+    → mark token as 'used'
+    → mark all other AZ tokens as 'invalidated'
+    → send cancellation follow-up email for each invalidated AZ
+    → write selected offering to SSM
+    → set approval-decision = 'proceed'
+    → trigger final confirmation email
+
+  REJECT on AZ-N email:
+    → mark token as 'declined'
+    → if other AZ tokens still 'pending' → those emails remain valid
+    → if ALL AZ tokens are 'declined'/'invalidated':
+        → send all-AZ-rejected email
+        → set approval-decision = 'all_rejected'
+        → trigger cleanup (pipeline stops)
+
+  CONFIRM final confirmation:
+    → set approval-decision = 'confirmed'
+
+  CANCEL final confirmation:
+    → set approval-decision = 'cancelled'
+    → trigger cleanup
 """
 
-import os
-import json
-import boto3
+import os, json, boto3
 from datetime import datetime
 
 AWS_REGION  = os.environ.get("AWS_REGION_NAME", "us-east-1")
@@ -21,59 +34,49 @@ SSM_PREFIX  = os.environ.get("SSM_PREFIX", "")
 TABLE_NAME  = os.environ.get("TABLE_NAME", "")
 PIPELINE_ID = os.environ.get("PIPELINE_RUN_ID", "")
 
-ssm    = boto3.client("ssm",           region_name=AWS_REGION)
-dynamo = boto3.resource("dynamodb",    region_name=AWS_REGION)
-sns    = boto3.client("sns",           region_name=AWS_REGION)
-sfn    = boto3.client("stepfunctions", region_name=AWS_REGION)
-lmb    = boto3.client("lambda",        region_name=AWS_REGION)
+ssm    = boto3.client("ssm",        region_name=AWS_REGION)
+dynamo = boto3.resource("dynamodb", region_name=AWS_REGION)
+lmb    = boto3.client("lambda",     region_name=AWS_REGION)
 
-# ---------------------------------------------------------------------------
-# HTML response templates
-# ---------------------------------------------------------------------------
-
-HTML_OK = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:60px auto;text-align:center;">
-<div style="background:#e8f5e9;border-radius:12px;padding:40px;">
-<h2 style="color:#2e7d32;">&#10003; {title}</h2>
-<p style="color:#555;">{message}</p>
-<p style="color:#888;font-size:12px;margin-top:30px;">Automated message — AWS GPU Capacity Block Reservation Pipeline.</p>
-</div></body></html>"""
-
-HTML_ALREADY = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:60px auto;text-align:center;">
-<div style="background:#fff3e0;border-radius:12px;padding:40px;">
-<h2 style="color:#e65100;">&#8505; {title}</h2>
-<p style="color:#555;">{message}</p>
-</div></body></html>"""
-
-HTML_EXPIRED = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:60px auto;text-align:center;">
-<div style="background:#fce4ec;border-radius:12px;padding:40px;">
-<h2 style="color:#c62828;">&#8855; Link Expired</h2>
-<p style="color:#555;">This approval link has expired or is invalid. Please check your inbox for a newer email, or contact your AWS administrator.</p>
-</div></body></html>"""
-
-HTML_WARN = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:60px auto;text-align:center;">
-<div style="background:#fff8e1;border-radius:12px;padding:40px;">
-<h2 style="color:#f57f17;">&#9888; {title}</h2>
-<p style="color:#555;">{message}</p>
-</div></body></html>"""
-
-def html_response(body: str, status: int = 200) -> dict:
+# ── HTML pages ────────────────────────────────────────────────────────────────
+def _page(bg, title_color, icon, title, message):
     return {
-        "statusCode": status,
+        "statusCode": 200,
         "headers": {"Content-Type": "text/html"},
-        "body": body
+        "body": f"""<!DOCTYPE html><html>
+<body style="font-family:Arial,sans-serif;max-width:600px;margin:60px auto;text-align:center;">
+<div style="background:{bg};border-radius:12px;padding:40px;">
+<h2 style="color:{title_color};">{icon} {title}</h2>
+<p style="color:#555;">{message}</p>
+<p style="color:#888;font-size:12px;margin-top:30px;">
+  Automated message — AWS GPU Capacity Block Reservation Pipeline.</p>
+</div></body></html>"""
     }
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def page_ok(title, msg):
+    return _page("#e8f5e9", "#2e7d32", "&#10003;", title, msg)
 
-def get_param(key: str) -> str:
+def page_warn(title, msg):
+    return _page("#fff3e0", "#e65100", "&#8505;", title, msg)
+
+def page_err(title, msg):
+    return _page("#fce4ec", "#c62828", "&#8855;", title, msg)
+
+def page_info(title, msg):
+    return _page("#fff8e1", "#f57f17", "&#9888;", title, msg)
+
+EXPIRED = page_err("Link Expired",
+    "This link has expired or is no longer valid. "
+    "Please check your inbox for a newer email.")
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def get_param(key):
     try:
         return ssm.get_parameter(Name=f"{SSM_PREFIX}/{key}")["Parameter"]["Value"]
     except Exception:
         return ""
 
-def put_param(key: str, value: str) -> None:
+def put_param(key, value):
     try:
         ssm.put_parameter(Name=f"{SSM_PREFIX}/{key}", Value=value,
                           Type="String", Overwrite=True)
@@ -83,17 +86,18 @@ def put_param(key: str, value: str) -> None:
 def get_table():
     return dynamo.Table(TABLE_NAME)
 
-def get_token_item(prefix: str, token: str) -> dict:
+def get_az_token(token):
     try:
-        resp = get_table().get_item(Key={"pk": f"{prefix}{token}"})
-        return resp.get("Item", {})
+        return get_table().get_item(
+            Key={"pk": f"proceed-token-{token}"}
+        ).get("Item", {})
     except Exception:
         return {}
 
-def update_token_status(prefix: str, token: str, status: str) -> None:
+def set_az_token_status(token, status):
     try:
         get_table().update_item(
-            Key={"pk": f"{prefix}{token}"},
+            Key={"pk": f"proceed-token-{token}"},
             UpdateExpression="SET #s=:s, updatedAt=:t",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
@@ -102,9 +106,28 @@ def update_token_status(prefix: str, token: str, status: str) -> None:
             }
         )
     except Exception as e:
-        print(f"[WARN] update_token_status {prefix}{token}: {e}")
+        print(f"[WARN] set_az_token_status {token}: {e}")
 
-def invoke_notify(action: str, extra: dict = None) -> None:
+def get_final_token(token):
+    try:
+        return get_table().get_item(
+            Key={"pk": f"final-token-{token}"}
+        ).get("Item", {})
+    except Exception:
+        return {}
+
+def set_final_token_status(token, status):
+    try:
+        get_table().update_item(
+            Key={"pk": f"final-token-{token}"},
+            UpdateExpression="SET #s=:s",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": status}
+        )
+    except Exception as e:
+        print(f"[WARN] set_final_token_status {token}: {e}")
+
+def invoke_notify(action, extra=None):
     try:
         payload = {"action": action, "pipelineRunId": PIPELINE_ID}
         if extra:
@@ -114,298 +137,254 @@ def invoke_notify(action: str, extra: dict = None) -> None:
             InvocationType="Event",
             Payload=json.dumps(payload).encode(),
         )
+        print(f"[lambda_approve] invoked notify:{action}")
     except Exception as e:
         print(f"[WARN] invoke_notify {action}: {e}")
 
-def invoke_cleanup(reason: str) -> None:
+def invoke_cleanup(reason):
     try:
         lmb.invoke(
             FunctionName=f"gpu-watcher-cleanup-{PIPELINE_ID}",
             InvocationType="Event",
             Payload=json.dumps({
-                "pipelineRunId": PIPELINE_ID,
-                "reason":        reason
+                "pipelineRunId": PIPELINE_ID, "reason": reason
             }).encode(),
         )
-        print(f"[lambda_approve] Cleanup triggered: {reason}")
+        print(f"[lambda_approve] cleanup triggered: {reason}")
     except Exception as e:
         print(f"[WARN] invoke_cleanup: {e}")
 
-def invoke_infra_cleanup() -> None:
-    """
-    Trigger deletion of permanent infrastructure resources
-    (the 8 resources from aws_check_create.sh) via lambda_infra_cleanup.
-    Falls back gracefully if that Lambda does not exist yet.
-    """
+def invoke_infra_cleanup():
     try:
         lmb.invoke(
             FunctionName=f"gpu-watcher-infra-cleanup-{PIPELINE_ID}",
             InvocationType="Event",
             Payload=json.dumps({
-                "pipelineRunId": PIPELINE_ID,
-                "reason":        "user_stop_terminate"
+                "pipelineRunId": PIPELINE_ID, "reason": "user_stop_terminate"
             }).encode(),
         )
-        print(f"[lambda_approve] Infra cleanup triggered")
     except Exception as e:
-        print(f"[WARN] invoke_infra_cleanup: {e} — "
-              f"run bash cleanup_infra.sh manually if needed")
+        print(f"[WARN] invoke_infra_cleanup: {e}")
 
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
-
-def handler(event: dict, context) -> dict:
+# ── main handler ──────────────────────────────────────────────────────────────
+def handler(event, context):
     params          = event.get("queryStringParameters") or {}
     token           = params.get("token",    "")
     decision        = params.get("decision", "").lower()
     pipeline_run_id = params.get("pid",      PIPELINE_ID)
 
-    print(f"[lambda_approve] token={token} decision={decision}")
+    print(f"[lambda_approve] token={token[:12] if token else ''!r} decision={decision}")
 
     if not token or not decision:
-        return html_response(
-            HTML_ALREADY.format(
-                title="Invalid Request",
-                message="This link is missing required parameters."
-            ), 400
-        )
+        return page_err("Invalid Request",
+                        "This link is missing required parameters.")
 
-    # ════════════════════════════════════════════════════════════
-    # PIPELINE CONTROL LINKS  (stop / stop_terminate / restart)
-    # Sent in every heartbeat and capacity-found email
-    # ════════════════════════════════════════════════════════════
+    # ── pipeline controls ─────────────────────────────────────────────────────
     if token.startswith("ctrl-"):
-
-        # Guard: only act once
-        ctrl_state = get_param("control-decision")
-        if ctrl_state in ("stop", "stop_terminate", "restart"):
-            return html_response(HTML_ALREADY.format(
-                title="Already Actioned",
-                message=(f"A control action ({ctrl_state}) was already "
-                         f"applied to this pipeline run.")
-            ))
-
+        existing = get_param("control-decision")
+        if existing in ("stop", "stop_terminate", "restart"):
+            return page_warn("Already Actioned",
+                f"Control action '{existing}' was already applied.")
         if decision == "stop":
             put_param("control-decision", "stop")
             invoke_cleanup("user_stop")
-            return html_response(HTML_OK.format(
-                title="Pipeline Stopped",
-                message=(
-                    "The watcher has been stopped. All temporary AWS "
-                    "watcher services (Step Functions, Lambda, DynamoDB, "
-                    "API Gateway) will be deleted shortly. Your permanent "
-                    "infrastructure (key pair, subnet, security group, "
-                    "placement group, IAM profile, SNS topic, launch "
-                    "template) has not been touched. No Capacity Block "
-                    "was purchased."
-                )
-            ))
-
+            return page_ok("Pipeline Stopped",
+                "All temporary watcher services will be deleted shortly. "
+                "Permanent infrastructure is untouched. No purchase was made.")
         if decision == "stop_terminate":
             put_param("control-decision", "stop_terminate")
-            # Step 1 — delete watcher services
             invoke_cleanup("user_stop_terminate")
-            # Step 2 — delete permanent infra
             invoke_infra_cleanup()
-            return html_response(HTML_WARN.format(
-                title="Pipeline Stopped — All Resources Being Deleted",
-                message=(
-                    "The watcher has been stopped and ALL resources are "
-                    "being deleted — including your permanent "
-                    "infrastructure (key pair, subnet, security group, "
-                    "placement group, IAM profile, SNS topic, launch "
-                    "template). Your AWS account will be in a clean state. "
-                    "Run bash main.sh to start a completely fresh pipeline."
-                )
-            ))
-
+            return page_info("Stopping — All Resources Being Deleted",
+                "The watcher has stopped and ALL resources are being deleted "
+                "including permanent infrastructure. Run bash main.sh to restart.")
         if decision == "restart":
             put_param("control-decision", "restart")
-            # Cleanup current run then redeploy is handled by Step Functions
-            # reset_watcher action — signal it here
             put_param("retry-quit-decision", "retry")
-            return html_response(HTML_OK.format(
-                title="Pipeline Restarting",
-                message=(
-                    "The current pipeline run is being reset. A fresh "
-                    "48-hour search window will begin immediately using "
-                    "the same configuration. You will receive a new "
-                    "pipeline started email shortly."
-                )
-            ))
+            return page_ok("Pipeline Restarting",
+                "A fresh 48-hour search window will begin immediately.")
+        return page_err("Unknown Control",
+                        f"Unrecognised control decision: {decision}")
 
-        return html_response(HTML_ALREADY.format(
-            title="Unknown Control Action",
-            message=f"Unrecognised control decision: {decision}"
-        ), 400)
-
-    # ════════════════════════════════════════════════════════════
-    # TIMEOUT RETRY / QUIT
-    # ════════════════════════════════════════════════════════════
+    # ── timeout retry / quit ──────────────────────────────────────────────────
     if token.startswith("timeout-"):
         if decision == "retry":
             put_param("retry-quit-decision", "retry")
-            return html_response(HTML_OK.format(
-                title="Retry Confirmed",
-                message=(
-                    "A fresh 48-hour search window has started. "
-                    "The attempt counter has been reset. You will "
-                    "receive an email when capacity becomes available "
-                    "or when the new window expires."
-                )
-            ))
-
+            return page_ok("Retry Confirmed",
+                "A fresh 48-hour search window has started.")
         if decision == "quit":
             put_param("retry-quit-decision", "quit")
             invoke_cleanup("user_quit")
-            return html_response(HTML_OK.format(
-                title="Pipeline Stopped",
-                message=(
-                    "The pipeline has been stopped. All temporary AWS "
-                    "watcher services will be deleted shortly. Your "
-                    "permanent infrastructure has not been touched. "
-                    "No charges were incurred."
-                )
-            ))
+            return page_ok("Pipeline Stopped",
+                "All temporary watcher services will be deleted shortly.")
+        return EXPIRED
 
-    # ════════════════════════════════════════════════════════════
-    # PROCEED — NEW HANDLER
-    # User clicked PROCEED TO CONFIRMATION from capacity found email
-    # ════════════════════════════════════════════════════════════
-    if decision == "proceed":
-        token_item = get_token_item("proceed-token-", token)
-
-        if not token_item:
-            return html_response(HTML_EXPIRED)
-
-        current_status = token_item.get("status", "")
-
-        if current_status == "used":
-            return html_response(HTML_ALREADY.format(
-                title="Already Proceeded",
-                message=(
-                    "You have already clicked PROCEED for this offering. "
-                    "Please check your inbox for the final confirmation email."
-                )
-            ))
-
-        if current_status == "expired":
-            return html_response(HTML_EXPIRED)
-
-        # Mark token as used
-        update_token_status("proceed-token-", token, "used")
-
-        # Write proceed signal to SSM — Step Functions polls this
-        put_param("approval-decision", "proceed")
-
-        # Load offering and trigger final confirmation email
-        offering_raw = token_item.get("offeringDetails", "{}")
-        offering     = json.loads(offering_raw) if offering_raw else {}
-
-        if offering:
-            invoke_notify("send_final_confirmation", {
-                "token":    token,
-                "offering": offering
-            })
-
-        region = offering.get("Region",           "N/A")
-        az     = offering.get("Availability Zone", "N/A")
-        fee    = offering.get("Upfront Fee",       "N/A")
-
-        return html_response(HTML_OK.format(
-            title="Proceeding to Final Confirmation",
-            message=(
-                f"Your selection for {region} / {az} ({fee}) has been "
-                f"received. A final confirmation email has been sent to "
-                f"you. Please check your inbox and click CONFIRM PURCHASE "
-                f"to complete the reservation. That email expires in "
-                f"30 minutes. Clicking CONFIRM is the only step that "
-                f"charges your account."
-            )
-        ))
-
-    # ════════════════════════════════════════════════════════════
-    # FINAL CONFIRMATION — CONFIRM or CANCEL
-    # ════════════════════════════════════════════════════════════
+    # ── final confirmation ────────────────────────────────────────────────────
     if token.startswith("final-"):
-        token_item = get_token_item("final-token-", token)
+        item   = get_final_token(token)
+        if not item:
+            return EXPIRED
+        status = item.get("status", "")
+        if status == "confirmed":
+            return page_warn("Already Confirmed",
+                "This reservation is already being processed.")
+        if status == "cancelled":
+            return page_warn("Already Cancelled",
+                "This reservation was already cancelled. No charge was made.")
 
-        if not token_item:
-            return html_response(HTML_EXPIRED)
-
-        current_status = token_item.get("status", "")
-
-        if current_status == "confirmed":
-            return html_response(HTML_ALREADY.format(
-                title="Already Confirmed",
-                message=(
-                    "This reservation has already been confirmed and "
-                    "is being processed. Check your inbox for the "
-                    "pipeline completion email."
-                )
-            ))
-
-        if current_status == "cancelled":
-            return html_response(HTML_ALREADY.format(
-                title="Already Cancelled",
-                message="This reservation was already cancelled. No charge was made."
-            ))
-
-        offering_raw = token_item.get("offeringDetails", "{}")
-        offering     = json.loads(offering_raw) if offering_raw else {}
-        region       = offering.get("Region",           "N/A")
-        az           = offering.get("Availability Zone", "N/A")
-        fee          = offering.get("Upfront Fee",       "N/A")
+        offering = json.loads(item.get("offeringDetails", "{}"))
+        region   = offering.get("Region",            "N/A")
+        az       = offering.get("Availability Zone",  "N/A")
+        fee      = offering.get("Upfront Fee",        "N/A")
 
         if decision == "confirm":
-            update_token_status("final-token-", token, "confirmed")
-
-            # Write all offering fields to SSM so reserve.sh can read them
-            put_param("offering-id",      offering.get("CapacityBlockOfferingId", ""))
-            put_param("region",           offering.get("Region",           ""))
-            put_param("az",               offering.get("Availability Zone", ""))
-            put_param("instance-type",    offering.get("Instance Type",     ""))
-            put_param("instance-count",   offering.get("Instance Count",    ""))
-            put_param("upfront-fee",      offering.get("Upfront Fee",       ""))
-            put_param("start-date",       offering.get("Start Date",        ""))
-            put_param("end-date",         offering.get("End Date",          ""))
+            set_final_token_status(token, "confirmed")
+            put_param("offering-id",       offering.get("CapacityBlockOfferingId", ""))
+            put_param("region",            offering.get("Region",           ""))
+            put_param("az",                offering.get("Availability Zone", ""))
+            put_param("instance-type",     offering.get("Instance Type",     ""))
+            put_param("instance-count",    offering.get("Instance Count",    ""))
+            put_param("upfront-fee",       offering.get("Upfront Fee",       ""))
+            put_param("start-date",        offering.get("Start Date",        ""))
+            put_param("end-date",          offering.get("End Date",          ""))
             put_param("selected-offering", json.dumps(offering, default=str))
-            # Signal Step Functions that purchase is confirmed
             put_param("approval-decision", "confirmed")
-
-            return html_response(HTML_OK.format(
-                title="Purchase Confirmed",
-                message=(
-                    f"Your Capacity Block reservation for "
-                    f"{region} / {az} ({fee}) is being purchased now. "
-                    f"You will receive a pipeline completion email when "
-                    f"the cluster is live and all instances have passed "
-                    f"health checks."
-                )
-            ))
+            return page_ok("Purchase Confirmed",
+                f"Your Capacity Block for {region} / {az} ({fee}) "
+                f"is being purchased now. A completion email will be sent "
+                f"when the cluster is live.")
 
         if decision == "cancel":
-            update_token_status("final-token-", token, "cancelled")
+            set_final_token_status(token, "cancelled")
             put_param("approval-decision", "cancelled")
             invoke_cleanup("user_cancel")
-            return html_response(HTML_OK.format(
-                title="Purchase Cancelled",
-                message=(
-                    "The reservation has been cancelled. No charges were "
-                    "made. All temporary watcher services will be deleted "
-                    "shortly. Your permanent infrastructure has not been "
-                    "touched."
-                )
-            ))
+            return page_ok("Purchase Cancelled",
+                "No charges were made. All temporary watcher services "
+                "will be deleted shortly.")
 
-    # ════════════════════════════════════════════════════════════
-    # Fallback
-    # ════════════════════════════════════════════════════════════
-    return html_response(HTML_ALREADY.format(
-        title="Unknown Action",
-        message=(
-            "This link contained an unrecognised action. "
-            "Please contact your AWS administrator."
+        return EXPIRED
+
+    # ── per-AZ PROCEED ────────────────────────────────────────────────────────
+    if decision == "proceed":
+        item   = get_az_token(token)
+        if not item:
+            return EXPIRED
+        status = item.get("status", "")
+
+        if status == "invalidated":
+            return page_warn("This AZ Is No Longer Available",
+                "Another AZ was already selected. This option has been cancelled.")
+        if status == "used":
+            return page_warn("Already Proceeded",
+                "You already clicked PROCEED for this AZ. "
+                "Check your inbox for the final confirmation email.")
+        if status == "declined":
+            return page_warn("Already Rejected",
+                "You already rejected this AZ.")
+
+        # Mark this token used
+        set_az_token_status(token, "used")
+
+        chosen_offering = json.loads(item.get("offeringDetails", "{}"))
+        all_tokens      = item.get("allTokens", [])
+
+        # Invalidate all other AZ tokens and send cancellation emails
+        for other_token in all_tokens:
+            if other_token == token:
+                continue
+            other_item = get_az_token(other_token)
+            other_status = other_item.get("status", "")
+            if other_status == "pending":
+                set_az_token_status(other_token, "invalidated")
+                other_offering = json.loads(
+                    other_item.get("offeringDetails", "{}"))
+                # Send cancellation follow-up email for this AZ
+                invoke_notify("send_az_cancelled", {
+                    "cancelledOffering": other_offering,
+                    "chosenOffering":    chosen_offering,
+                })
+                print(f"[lambda_approve] Sent cancellation for "
+                      f"{other_offering.get('Availability Zone','?')}")
+
+        # Write selected offering + signal Step Functions
+        put_param("selected-offering", json.dumps(chosen_offering, default=str))
+        put_param("proceed-token",     token)
+        put_param("approval-decision", "proceed")
+
+        # Trigger final confirmation email
+        invoke_notify("send_final_confirmation", {"token": token})
+
+        region = chosen_offering.get("Region",            "N/A")
+        az     = chosen_offering.get("Availability Zone",  "N/A")
+        fee    = chosen_offering.get("Upfront Fee",        "N/A")
+
+        return page_ok(
+            f"AZ Selected — Final Confirmation Sent",
+            f"You selected {region} / {az} ({fee}). "
+            f"All other AZ emails have been cancelled and a cancellation "
+            f"notice has been sent for each. "
+            f"Check your inbox for the final confirmation email. "
+            f"Clicking CONFIRM PURCHASE in that email is the only step "
+            f"that charges your account."
         )
-    ), 400)
+
+    # ── per-AZ REJECT ─────────────────────────────────────────────────────────
+    if decision == "reject":
+        item   = get_az_token(token)
+        if not item:
+            return EXPIRED
+        status = item.get("status", "")
+
+        if status == "invalidated":
+            return page_warn("This AZ Is No Longer Available",
+                "Another AZ was already selected. This option has been cancelled.")
+        if status in ("declined", "used"):
+            return page_warn("Already Responded",
+                f"You have already responded to this AZ ({status}).")
+
+        # Mark this token as declined
+        set_az_token_status(token, "declined")
+
+        offering = json.loads(item.get("offeringDetails", "{}"))
+        region   = offering.get("Region",            "N/A")
+        az       = offering.get("Availability Zone",  "N/A")
+        all_tokens = item.get("allTokens", [])
+
+        # Check if any tokens are still pending
+        pending_tokens = []
+        for t in all_tokens:
+            if t == token:
+                continue
+            other_item   = get_az_token(t)
+            other_status = other_item.get("status", "")
+            if other_status == "pending":
+                pending_tokens.append(t)
+
+        if pending_tokens:
+            # Other AZ emails still active — user can act on them
+            return page_ok(
+                f"AZ Declined — {len(pending_tokens)} Other AZ Email(s) Active",
+                f"You rejected {region} / {az}. "
+                f"You have {len(pending_tokens)} other AZ email(s) still active "
+                f"in your inbox. Click PROCEED on one of them to select it, "
+                f"or REJECT to decline it too."
+            )
+        else:
+            # ALL AZ tokens are now declined or invalidated
+            # Send all-AZ-rejected email and stop the pipeline
+            invoke_notify("send_all_az_rejected")
+            put_param("approval-decision", "all_rejected")
+            invoke_cleanup("user_rejected_all_az")
+
+            return page_ok(
+                "All AZs Declined — Pipeline Stopping",
+                f"You rejected {region} / {az}. "
+                f"All available AZ options have now been declined. "
+                f"The pipeline is stopping and all temporary watcher "
+                f"services will be deleted. You will receive a "
+                f"notification email confirming the pipeline has stopped. "
+                f"Run bash main.sh to start a new search."
+            )
+
+    return page_err("Unknown Action",
+                    "This link contained an unrecognised action.")

@@ -101,10 +101,50 @@ LT_ID="${LAUNCH_TEMPLATE_ID:-}"
 
 info "Using launch template: $LT_ID"
 
+# ── Pick correct subnet for the selected AZ ───────────────────────────────────
+# The launch template has one subnet (AZ1). If user chose a different AZ via
+# email, we must override the subnet to match the capacity reservation AZ.
+# Read AZ list from config.env to find which subnet index to use.
+SELECTED_AZ=$(get_param "az")
+SELECTED_AZ="${SELECTED_AZ:-}"
+
+LAUNCH_SUBNET_OVERRIDE=""
+if [[ -n "$SELECTED_AZ" ]]; then
+  # Build AZ → subnet map from config.env
+  IFS=',' read -ra _AZ_LIST   <<< "${AVAILABILITY_ZONES:-}"
+  # Subnet list: first entry = SUBNET_ID, subsequent = SUBNET_ID_AZ2, SUBNET_ID_AZ3 ...
+  _SUBNET_LIST=("${SUBNET_ID:-}")
+  [[ -n "${SUBNET_ID_AZ2:-}" ]] && _SUBNET_LIST+=("${SUBNET_ID_AZ2}")
+  [[ -n "${SUBNET_ID_AZ3:-}" ]] && _SUBNET_LIST+=("${SUBNET_ID_AZ3}")
+
+  for _i in "${!_AZ_LIST[@]}"; do
+    _AZ_ENTRY=$(echo "${_AZ_LIST[$_i]}" | tr -d ' ')
+    if [[ "$_AZ_ENTRY" == "$SELECTED_AZ" ]]; then
+      LAUNCH_SUBNET_OVERRIDE="${_SUBNET_LIST[$_i]:-}"
+      break
+    fi
+  done
+fi
+
+if [[ -n "$LAUNCH_SUBNET_OVERRIDE" ]]; then
+  info "Subnet override for AZ $SELECTED_AZ : $LAUNCH_SUBNET_OVERRIDE"
+else
+  info "No subnet override — using launch template default subnet"
+fi
+
+# Build the run-instances command
+# If we have a subnet override, pass it via --network-interfaces to replace
+# the subnet baked into the launch template
+SUBNET_ARGS=""
+if [[ -n "$LAUNCH_SUBNET_OVERRIDE" ]]; then
+  SUBNET_ARGS="--network-interfaces DeviceIndex=0,SubnetId=${LAUNCH_SUBNET_OVERRIDE},Groups=${SECURITY_GROUP_IDS:-},InterfaceType=efa,DeleteOnTermination=true"
+fi
+
 INSTANCE_IDS_JSON=$(aws $PROFILE_FLAG ec2 run-instances \
   --region "$LAUNCH_REGION" \
   --launch-template "LaunchTemplateId=${LT_ID},Version=\$Latest" \
   --count "${INSTANCE_COUNT:-1}" \
+  ${SUBNET_ARGS} \
   --tag-specifications \
     "ResourceType=instance,Tags=[\
 {Key=Name,Value=gpu-capacity-block-instance},\

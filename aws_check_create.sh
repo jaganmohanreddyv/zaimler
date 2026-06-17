@@ -15,9 +15,10 @@
 #  NEW-1  Section 3.5 — Cluster placement group (required for p5/p4d/trn2)
 #  NEW-2  Section 7   — Launch template with CapacityReservationTarget
 #  NEW-3  --dry-run flag: audit-only mode, no AWS resources created
-#  NEW-4  Section 7   — Instance type mismatch detection: if config.env
-#          INSTANCE_TYPES changed since template was created, a new version
-#          is created automatically with the correct AMI and instance type
+#  NEW-4  Section 7   — Instance type mismatch detection: compares $Latest
+#          version against config.env INSTANCE_TYPES. If different, creates a
+#          new version automatically. Default version never changed — pipeline
+#          always uses $Latest via launch.sh (Version=$Latest).
 # =============================================================================
 
 set -euo pipefail
@@ -350,6 +351,117 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
         patch_config "AVAILABILITY_ZONES" "$SEL_AZ"
         AZ="$SEL_AZ"
         FOUND+=("Subnet: $SEL_ID  AZ=$SEL_AZ  CIDR=$SEL_CIDR")
+      fi
+    fi
+  fi
+fi
+
+
+# =============================================================================
+# 2.5 SECOND SUBNET (for multi-AZ — only when AVAILABILITY_ZONES has 2+ AZs)
+# =============================================================================
+header "2.5 / 8  Second Subnet  (multi-AZ)"
+
+# Count how many AZs are configured
+AZ_COUNT=$(echo "${AVAILABILITY_ZONES:-}" | tr ',' '\n' | grep -v "^$" | wc -l | tr -d ' \t\r\n')
+AZ_COUNT="${AZ_COUNT//[^0-9]/}"
+AZ_COUNT="${AZ_COUNT:-1}"
+
+if [[ "$AZ_COUNT" -lt 2 ]]; then
+  info "Single AZ configured — skipping second subnet check."
+else
+  AZ2=$(echo "${AVAILABILITY_ZONES:-}" | cut -d',' -f2 | tr -d ' ')
+  CURRENT_SUBNET2="${SUBNET_ID_AZ2:-}"
+  SUBNET2_EXISTS=false
+
+  if [[ -n "$CURRENT_SUBNET2" ]]; then
+    SUBNET2_LINE=$(aws_safe ec2 describe-subnets \
+      --subnet-ids "$CURRENT_SUBNET2" \
+      --query "Subnets[0].[AvailabilityZone,State,AvailableIpAddressCount]")
+    if [[ -n "$SUBNET2_LINE" && "$SUBNET2_LINE" != "None" ]]; then
+      S2_AZ=$(echo "$SUBNET2_LINE"    | awk '{print $1}')
+      S2_STATE=$(echo "$SUBNET2_LINE" | awk '{print $2}')
+      S2_FREE=$(echo "$SUBNET2_LINE"  | awk '{print $3}')
+      ok "Second subnet '$CURRENT_SUBNET2' exists  (AZ: $S2_AZ, State: $S2_STATE, Free IPs: $S2_FREE)"
+      SUBNET2_EXISTS=true
+      FOUND+=("Second subnet: $CURRENT_SUBNET2  AZ=$S2_AZ")
+      [[ "$S2_AZ" != "$AZ2" ]] && \
+        warn "Second subnet AZ ($S2_AZ) ≠ second AVAILABILITY_ZONES entry ($AZ2)"
+    else
+      warn "SUBNET_ID_AZ2 '$CURRENT_SUBNET2' NOT found in AWS."
+    fi
+  else
+    info "SUBNET_ID_AZ2 is empty — need a subnet in $AZ2"
+  fi
+
+  if [[ "$SUBNET2_EXISTS" == false ]]; then
+    info "Scanning for available subnets in $AZ2..."
+    echo ""
+    echo -e "${BOLD}  Subnets available in $AZ2:${NC}"
+    echo ""
+
+    AZ2_RAW=$(aws_safe ec2 describe-subnets \
+      --filters "Name=state,Values=available" "Name=availabilityZone,Values=${AZ2}" \
+      --query "Subnets[*].[SubnetId,AvailabilityZone,CidrBlock,VpcId]" \
+      2>/dev/null | tr '\t' '|' || echo "")
+
+    if [[ -z "$AZ2_RAW" ]]; then
+      warn "No subnets found in $AZ2."
+      warn "Create one manually then set SUBNET_ID_AZ2 in config.env"
+      warn "  aws ec2 create-subnet --vpc-id <VPC_ID> --cidr-block <CIDR> --availability-zone $AZ2"
+      SKIPPED+=("Second subnet: none found in $AZ2 — create manually")
+    else
+      IDX2=1
+      declare -a S2_IDS=() S2_AZNS=() S2_CIDRS=() S2_VPCS=()
+      while IFS='|' read -r SID SAZ SCIDR SVPC; do
+        [[ -z "$SID" || "$SID" == "None" ]] && continue
+        printf "  ${GREEN}[%d]${NC}  %-26s  AZ: %-12s  CIDR: %-18s  VPC: %s\n" \
+          "$IDX2" "$SID" "$SAZ" "$SCIDR" "$SVPC"
+        S2_IDS+=("$SID"); S2_AZNS+=("$SAZ"); S2_CIDRS+=("$SCIDR"); S2_VPCS+=("$SVPC")
+        IDX2=$((IDX2+1))
+      done <<< "$AZ2_RAW"
+
+      echo ""
+      echo -e "  ${CYAN}[c]${NC}  Enter a custom subnet ID"
+      echo ""
+
+      TOTAL2=${#S2_IDS[@]}
+      if [[ $TOTAL2 -eq 1 ]]; then
+        CHOSEN2=0
+        info "Only one subnet in $AZ2 — selecting automatically."
+      else
+        while true; do
+          read -rp "  Choose [1-${TOTAL2}] or c for custom: " CHOICE2
+          CHOICE2=$(echo "$CHOICE2" | tr -d ' ')
+          if [[ "$CHOICE2" == "c" || "$CHOICE2" == "C" ]]; then
+            read -rp "  Enter subnet ID (subnet-xxxx): " CUSTOM2
+            CUSTOM2=$(echo "$CUSTOM2" | tr -d ' ')
+            CUSTOM2_INFO=$(aws_safe ec2 describe-subnets \
+              --subnet-ids "$CUSTOM2" \
+              --query "Subnets[0].[SubnetId,AvailabilityZone]" 2>/dev/null || echo "")
+            if [[ -z "$CUSTOM2_INFO" || "$CUSTOM2_INFO" == "None" ]]; then
+              fail "Subnet '$CUSTOM2' not found. Try again."
+              continue
+            fi
+            CHOSEN_ID2="$CUSTOM2"
+            ok "Custom subnet: $CHOSEN_ID2"
+            [[ "$DRY_RUN" == false ]] && patch_config "SUBNET_ID_AZ2" "$CHOSEN_ID2"
+            SUBNET2_EXISTS=true
+            break
+          fi
+          if [[ "$CHOICE2" =~ ^[0-9]+$ ]] && [[ "$CHOICE2" -ge 1 ]] && [[ "$CHOICE2" -le "$TOTAL2" ]]; then
+            CHOSEN2=$((CHOICE2-1))
+            break
+          fi
+          fail "Invalid choice. Enter 1-${TOTAL2} or c."
+        done
+      fi
+
+      if [[ "$SUBNET2_EXISTS" == false ]]; then
+        CHOSEN_ID2="${S2_IDS[$CHOSEN2]}"
+        ok "Selected second subnet: $CHOSEN_ID2  AZ=${S2_AZNS[$CHOSEN2]}"
+        [[ "$DRY_RUN" == false ]] && patch_config "SUBNET_ID_AZ2" "$CHOSEN_ID2"
+        FOUND+=("Second subnet: $CHOSEN_ID2  AZ=${S2_AZNS[$CHOSEN2]}")
       fi
     fi
   fi
@@ -940,29 +1052,28 @@ if [[ -n "$CURRENT_LT" ]]; then
 
   if [[ -n "$LT_LINE" && "$LT_LINE" != "None" ]]; then
     LT_ID_FOUND=$(echo "$LT_LINE"  | awk '{print $1}')
-    LT_DEF_V=$(echo "$LT_LINE"     | awk '{print $2}')
     LT_LAT_V=$(echo "$LT_LINE"     | awk '{print $3}')
 
-    # ── NEW-4: Check instance type in current default version ─────────────────
-    # If config.env INSTANCE_TYPES changed since the template was created,
-    # the existing template has the wrong instance type baked in.
-    # Detect this and create a new version automatically.
+    # ── NEW-4: Check instance type in $Latest version ─────────────────────────
+    # Pipeline always uses $Latest (launch.sh: Version=$Latest) so we compare
+    # against $Latest only. Default version concept is unused and ignored.
+    # If config.env INSTANCE_TYPES changed, detect it and create a new version.
     CURRENT_LT_ITYPE=$(aws_safe ec2 describe-launch-template-versions \
       --launch-template-id "$LT_ID_FOUND" \
-      --versions "\$Default" \
+      --versions "\$Latest" \
       --query "LaunchTemplateVersions[0].LaunchTemplateData.InstanceType")
 
-    ok "Launch template '$CURRENT_LT' exists  (ID: $LT_ID_FOUND, default v$LT_DEF_V, latest v$LT_LAT_V)"
-    info "Template instance type : ${CURRENT_LT_ITYPE:-unknown}"
-    info "config.env instance type: $CB_INSTANCE_TYPE"
+    ok "Launch template '$CURRENT_LT' exists  (ID: $LT_ID_FOUND, latest v$LT_LAT_V)"
+    info "Template latest instance type : ${CURRENT_LT_ITYPE:-unknown}"
+    info "config.env instance type      : $CB_INSTANCE_TYPE"
 
     if [[ -n "$CURRENT_LT_ITYPE" && \
           "$CURRENT_LT_ITYPE" != "None" && \
           "$CURRENT_LT_ITYPE" != "$CB_INSTANCE_TYPE" ]]; then
       warn "Instance type mismatch detected!"
-      warn "  Template default version uses : $CURRENT_LT_ITYPE"
+      warn "  Template \$Latest uses         : $CURRENT_LT_ITYPE"
       warn "  config.env INSTANCE_TYPES is  : $CB_INSTANCE_TYPE"
-      warn "  A new launch template version will be created automatically."
+      warn "  A new \$Latest version will be created automatically."
       LT_EXISTS=true
       LT_NEEDS_UPDATE=true
       LT_ID_TO_UPDATE="$LT_ID_FOUND"
@@ -980,14 +1091,17 @@ fi
 
 # ── Resolve AMI for create or update ─────────────────────────────────────────
 resolve_ami() {
+  # IMPORTANT: called inside $(...) subshell — ALL status output must go to
+  # stderr (>&2) so only the bare AMI ID reaches stdout. Any extra text
+  # captured by $() corrupts the variable and kills the script under set -e.
   local itype="$1"
   local resolved_ami="${CB_AMI_ID:-}"
 
   if [[ -z "$resolved_ami" || "$resolved_ami" == "ami-XXXXXXXX" ]]; then
-    warn "AMI_ID not set or is placeholder — auto-discovering correct AMI for $itype..."
+    warn "AMI_ID not set — auto-discovering correct AMI for $itype..." >&2
 
     if [[ "$itype" == trn* ]]; then
-      info "Trainium instance — searching for Neuron AMI..."
+      info "Trainium instance — searching for Neuron AMI..." >&2
       resolved_ami=$(aws_safe ec2 describe-images \
         --owners amazon --region "$AWS_REGION" \
         --filters \
@@ -1004,28 +1118,69 @@ resolve_ami() {
             "Name=architecture,Values=x86_64" \
           --query "sort_by(Images,&CreationDate)[-1].ImageId")
         [[ -n "$resolved_ami" && "$resolved_ami" != "None" ]] && \
-          warn "Using Amazon Linux 2023 AMI — install Neuron SDK manually after launch"
+          warn "Using Amazon Linux 2023 AMI — install Neuron SDK manually after launch" >&2
       fi
     else
-      info "GPU instance — searching for Deep Learning GPU AMI..."
-      resolved_ami=$(aws_safe ec2 describe-images \
-        --owners amazon --region "$AWS_REGION" \
-        --filters \
-          "Name=name,Values=Deep Learning AMI GPU PyTorch*" \
-          "Name=state,Values=available" \
-          "Name=architecture,Values=x86_64" \
-        --query "sort_by(Images,&CreationDate)[-1].ImageId")
+      info "GPU instance — searching for Deep Learning GPU AMI..." >&2
+
+      # Method 1a: SSM — PyTorch 2.8 Ubuntu 24.04 (latest as of 2026)
+      resolved_ami=$(aws $PROFILE_FLAG ssm get-parameter \
+        --region "$AWS_REGION" \
+        --name "/aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.8-ubuntu-24.04/latest/ami-id" \
+        --query "Parameter.Value" --output text 2>/dev/null || echo "")
+
+      # Method 1b: SSM — PyTorch 2.7 Ubuntu 22.04
+      if [[ -z "$resolved_ami" || "$resolved_ami" == "None" ]]; then
+        info "Trying PyTorch 2.7 Ubuntu 22.04 SSM path..." >&2
+        resolved_ami=$(aws $PROFILE_FLAG ssm get-parameter \
+          --region "$AWS_REGION" \
+          --name "/aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.7-ubuntu-22.04/latest/ami-id" \
+          --query "Parameter.Value" --output text 2>/dev/null || echo "")
+      fi
+
+      # Method 1c: SSM — PyTorch 2.8 Amazon Linux 2023
+      if [[ -z "$resolved_ami" || "$resolved_ami" == "None" ]]; then
+        info "Trying PyTorch 2.8 Amazon Linux 2023 SSM path..." >&2
+        resolved_ami=$(aws $PROFILE_FLAG ssm get-parameter \
+          --region "$AWS_REGION" \
+          --name "/aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.8-amazon-linux-2023/latest/ami-id" \
+          --query "Parameter.Value" --output text 2>/dev/null || echo "")
+      fi
+
+      # Method 2: describe-images — OSS Nvidia naming pattern (current)
+      if [[ -z "$resolved_ami" || "$resolved_ami" == "None" ]]; then
+        info "SSM failed — trying describe-images OSS pattern..." >&2
+        resolved_ami=$(aws_safe ec2 describe-images \
+          --owners amazon --region "$AWS_REGION" \
+          --filters \
+            "Name=name,Values=Deep Learning OSS Nvidia Driver AMI GPU PyTorch*" \
+            "Name=state,Values=available" \
+            "Name=architecture,Values=x86_64" \
+          --query "sort_by(Images,&CreationDate)[-1].ImageId")
+      fi
+
+      # Method 3: describe-images — legacy naming pattern
+      if [[ -z "$resolved_ami" || "$resolved_ami" == "None" ]]; then
+        info "Trying legacy Deep Learning AMI pattern..." >&2
+        resolved_ami=$(aws_safe ec2 describe-images \
+          --owners amazon --region "$AWS_REGION" \
+          --filters \
+            "Name=name,Values=Deep Learning AMI GPU PyTorch*" \
+            "Name=state,Values=available" \
+            "Name=architecture,Values=x86_64" \
+          --query "sort_by(Images,&CreationDate)[-1].ImageId")
+      fi
     fi
 
     if [[ -n "$resolved_ami" && "$resolved_ami" != "None" ]]; then
-      info "Auto-discovered AMI: $resolved_ami"
-      patch_config "AMI_ID" "$resolved_ami"
+      info "Auto-discovered AMI: $resolved_ami" >&2
       CB_AMI_ID="$resolved_ami"
     else
-      fail "Could not auto-discover AMI for $itype. Set AMI_ID in config.env and re-run."
+      fail "Could not auto-discover AMI for $itype. Set AMI_ID in config.env and re-run." >&2
       exit 1
     fi
   fi
+  # Only the bare AMI ID to stdout — captured cleanly by $()
   echo "$resolved_ami"
 }
 
@@ -1038,6 +1193,10 @@ if [[ "$LT_NEEDS_UPDATE" == true ]]; then
     dryrun "  InstanceType: $CB_INSTANCE_TYPE  AMI: $RESOLVED_AMI"
     SKIPPED+=("Launch template: dry-run, would update $CURRENT_LT for $CB_INSTANCE_TYPE")
   else
+    # patch_config called here (outside subshell) to write AMI_ID to config.env
+    # resolve_ami set CB_AMI_ID but could not call patch_config from inside $()
+    [[ -n "$CB_AMI_ID" ]] && patch_config "AMI_ID" "$CB_AMI_ID"
+
     info "Creating new launch template version..."
     info "  Instance type : $CB_INSTANCE_TYPE"
     info "  AMI           : $RESOLVED_AMI"
@@ -1051,14 +1210,14 @@ if [[ "$LT_NEEDS_UPDATE" == true ]]; then
       --launch-template-data "$LT_UPDATE_DATA" \
       --query "LaunchTemplateVersion.VersionNumber")
 
-    aws_cmd ec2 modify-launch-template \
-      --launch-template-id "$LT_ID_TO_UPDATE" \
-      --default-version "$NEW_LT_VERSION" > /dev/null
+    # Default version intentionally NOT updated — pipeline always uses $Latest.
+    # launch.sh calls RunInstances with Version=$Latest so default is irrelevant.
 
-    ok "Launch template updated — new default version: v${NEW_LT_VERSION}"
+    ok "Launch template updated — new \$Latest version: v${NEW_LT_VERSION}"
     ok "  Instance type : $CB_INSTANCE_TYPE"
     ok "  AMI           : $RESOLVED_AMI"
-    CREATED+=("Launch template update: $CURRENT_LT → v${NEW_LT_VERSION}  ($CB_INSTANCE_TYPE)")
+    info "Pipeline uses \$Latest — default version unchanged (not relevant)"
+    CREATED+=("Launch template update: $CURRENT_LT → v${NEW_LT_VERSION} \$Latest  ($CB_INSTANCE_TYPE)")
   fi
 fi
 
@@ -1077,6 +1236,14 @@ if [[ "$LT_EXISTS" == false ]]; then
     info "Targeting Capacity Block: $CB_RESERVATION_ID"
     CB_CR_SPEC="\"CapacityReservationPreference\": \"none\", \"CapacityReservationTarget\": { \"CapacityReservationId\": \"${CB_RESERVATION_ID}\" }"
   fi
+
+  # Re-source config.env — patch_config wrote new values (subnet, SG, etc.)
+  # to the file but did not update the running shell environment.
+  # Without this re-source RESOLVED_SUBNET etc. will be empty.
+  CLEAN_RESYNC="/tmp/config_resync_$$.env"
+  sed 's/\r//' "$CONFIG_FILE" > "$CLEAN_RESYNC"
+  set +u; source "$CLEAN_RESYNC"; set -u
+  rm -f "$CLEAN_RESYNC"
 
   RESOLVED_SG="${SECURITY_GROUP_IDS:-}"
   RESOLVED_SUBNET="${SUBNET_ID:-}"

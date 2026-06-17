@@ -220,15 +220,26 @@ def handler(event: dict, context) -> dict:
     print(f"[lambda_discovery] action={action} pipeline={pipeline_run_id}")
 
     # ── check_approval ───────────────────────────────────────────────────────
-    # UPDATED: simplified — only checks for 'proceed' signal.
-    # Old YES/WAIT/NO multi-token logic removed.
+    # Multi-AZ flow decisions:
+    #   proceed      → user clicked PROCEED on one AZ (go to WaitForConfirm)
+    #   confirmed    → user clicked CONFIRM PURCHASE (go to PipelineApproved)
+    #   cancelled    → user clicked CANCEL (go to CleanupAndExit)
+    #   all_rejected → user rejected ALL AZ emails — clear state, resume scan
+    #   pending      → no response yet — keep waiting
     if action == "check_approval":
         approval = get_param("approval-decision")
         print(f"[lambda_discovery] check_approval → decision={approval}")
         if approval == "proceed":
             return {"decision": "proceed"}
+        if approval == "confirmed":
+            return {"decision": "confirmed"}
         if approval == "cancelled":
             return {"decision": "cancelled"}
+        if approval == "all_rejected":
+            # All AZs rejected — pipeline stops, routes to CleanupAndExit
+            # (cleanup already triggered by lambda_approve)
+            print("[lambda_discovery] All AZs rejected — pipeline stopping")
+            return {"decision": "all_rejected"}
         # No response yet — keep waiting
         return {"decision": "pending"}
 

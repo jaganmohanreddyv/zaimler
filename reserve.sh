@@ -129,32 +129,33 @@ LT_ID="${LAUNCH_TEMPLATE_ID:-}"
 [[ -z "$LT_ID" || "$LT_ID" == "None" ]] && {
   warn "Launch template not found — skipping update. Set LAUNCH_TEMPLATE_ID in config.env"
 } || {
-  LT_UPDATE_FILE="/tmp/lt_update_$$.json"
-  cat > "$LT_UPDATE_FILE" <<EOF
-{
-  "CapacityReservationSpecification": {
-    "CapacityReservationPreference": "none",
-    "CapacityReservationTarget": {
-      "CapacityReservationId": "${RESERVATION_ID}"
+  # FIXED: avoid file:///tmp/ path — MSYS path conversion mangles it on Windows Git Bash
+  # Use Python zipfile-style inline JSON via --cli-input-json instead
+  LT_UPDATE_JSON=$(python3 -c "
+import json
+print(json.dumps({
+  'LaunchTemplateId': '${LT_ID}',
+  'SourceVersion': '\$Latest',
+  'VersionDescription': 'Targeting Capacity Block ${RESERVATION_ID}',
+  'LaunchTemplateData': {
+    'CapacityReservationSpecification': {
+      'CapacityReservationPreference': 'none',
+      'CapacityReservationTarget': {
+        'CapacityReservationId': '${RESERVATION_ID}'
+      }
     }
   }
-}
-EOF
+}))
+")
+
   NEW_LT_VERSION=$(aws $PROFILE_FLAG ec2 create-launch-template-version \
     --region "$RESERVE_REGION" \
-    --launch-template-id "$LT_ID" \
-    --source-version "\$Latest" \
-    --version-description "Targeting Capacity Block ${RESERVATION_ID}" \
-    --launch-template-data "file://${LT_UPDATE_FILE}" \
+    --cli-input-json "$LT_UPDATE_JSON" \
     --query "LaunchTemplateVersion.VersionNumber" \
     --output text)
-  rm -f "$LT_UPDATE_FILE"
 
-  aws $PROFILE_FLAG ec2 modify-launch-template \
-    --region "$RESERVE_REGION" \
-    --launch-template-id "$LT_ID" \
-    --default-version "$NEW_LT_VERSION" > /dev/null
-  ok "Launch template $LT_ID updated — version $NEW_LT_VERSION targets $RESERVATION_ID"
+  # Default version NOT updated — pipeline always uses $Latest
+  ok "Launch template $LT_ID updated — new \$Latest v${NEW_LT_VERSION} targets ${RESERVATION_ID}"
 }
 
 # ── Write reservation ID to SSM and config.env ────────────────────────────────

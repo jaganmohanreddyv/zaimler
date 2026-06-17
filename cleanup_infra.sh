@@ -245,8 +245,8 @@ if [[ -n "$CK_LT_ID" || -n "$CK_LT_NAME" ]]; then
       --query "LaunchTemplates[0].Tags[?Key=='LaunchedBy'].Value" \
       | tr '\t' '\n' | head -1)
 
-    if [[ "$LT_TAG" == "aws_check_create.sh" || -z "$LT_TAG" ]]; then
-      # Tag matches or tag not present (pre-tag version) — safe to delete
+    if [[ "$LT_TAG" == "aws_check_create.sh" || -z "$LT_TAG" || "$LT_TAG" == "None" ]]; then
+      # Tag matches, tag not present, or AWS returned None — safe to delete
       [[ "$DRY_RUN" == true ]] && \
         dr "ec2 delete-launch-template --launch-template-id $LT_FOUND (all versions)" || {
         _ec2 delete-launch-template \
@@ -543,12 +543,16 @@ if [[ -n "$CK_SG" ]]; then
       fi
 
       # Guard: check no instances are still using this SG
-      IN_USE=$(_ec2 describe-instances \
+      # Use wc -l instead of grep -c to avoid Windows Git Bash returning
+      # multi-line output (e.g. '0\n0') that breaks arithmetic comparison
+      IN_USE_RAW=$(_ec2 describe-instances \
         --filters \
           "Name=network-interface.group-id,Values=$SG_ID" \
           "Name=instance-state-name,Values=running,pending,stopping,stopped" \
         --query "Reservations[*].Instances[*].InstanceId" \
-        | tr '\t' '\n' | grep -c "i-" || echo "0")
+        | tr '\t' '\n' | grep "i-" | wc -l | tr -d ' \t\r\n' || echo "0")
+      IN_USE="${IN_USE_RAW//[^0-9]/}"
+      IN_USE="${IN_USE:-0}"
 
       if [[ "$IN_USE" -gt 0 && "$DRY_RUN" == false ]]; then
         fail "Security group $SG_ID is still attached to $IN_USE instance(s)"

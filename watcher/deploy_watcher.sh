@@ -518,6 +518,11 @@ SM_DEFINITION="{
           \"Variable\": \"$.proceedResult.decision\",
           \"StringEquals\": \"cancelled\",
           \"Next\": \"CleanupAndExit\"
+        },
+        {
+          \"Variable\": \"$.proceedResult.decision\",
+          \"StringEquals\": \"all_rejected\",
+          \"Next\": \"CleanupAndExit\"
         }
       ],
       \"Default\": \"WaitForNextRetry\"
