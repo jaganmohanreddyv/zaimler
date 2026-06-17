@@ -122,22 +122,158 @@ if [[ "$DRY_RUN" == false && -f "${FINDER_DIR}/requirements.txt" ]]; then
   ok "Dependencies installed"
 fi
 
-# ── Step 4: Build combination list ───────────────────────────────────────────
-header "Step 4 / 6  Building combination list"
+# ── Step 4: Interactive region + AZ wizard ────────────────────────────────
+header "Step 4 / 6  Select Regions and Availability Zones"
+
+# ── All AWS regions that support Capacity Blocks ──────────────────────────────
+ALL_CB_REGIONS=(
+  "us-east-1      (N. Virginia)"
+  "us-east-2      (Ohio)"
+  "us-west-2      (Oregon)"
+  "eu-west-1      (Ireland)"
+  "eu-central-1   (Frankfurt)"
+  "ap-northeast-1 (Tokyo)"
+  "ap-southeast-1 (Singapore)"
+  "ap-southeast-2 (Sydney)"
+)
+
+# ── AZs per region ────────────────────────────────────────────────────────────
+declare -A REGION_AZS
+REGION_AZS["us-east-1"]="us-east-1a us-east-1b us-east-1c us-east-1d us-east-1e us-east-1f"
+REGION_AZS["us-east-2"]="us-east-2a us-east-2b us-east-2c"
+REGION_AZS["us-west-2"]="us-west-2a us-west-2b us-west-2c us-west-2d"
+REGION_AZS["eu-west-1"]="eu-west-1a eu-west-1b eu-west-1c"
+REGION_AZS["eu-central-1"]="eu-central-1a eu-central-1b eu-central-1c"
+REGION_AZS["ap-northeast-1"]="ap-northeast-1a ap-northeast-1c ap-northeast-1d"
+REGION_AZS["ap-southeast-1"]="ap-southeast-1a ap-southeast-1b ap-southeast-1c"
+REGION_AZS["ap-southeast-2"]="ap-southeast-2a ap-southeast-2b ap-southeast-2c"
+
+echo ""
+echo -e "${BOLD}  Available AWS regions for Capacity Blocks:${NC}"
+echo ""
+for i in "${!ALL_CB_REGIONS[@]}"; do
+  printf "  ${GREEN}[%d]${NC}  %s\n" "$((i+1))" "${ALL_CB_REGIONS[$i]}"
+done
+echo ""
+
+# ── Ask how many regions ──────────────────────────────────────────────────────
+while true; do
+  read -rp "  How many regions do you want to scan? [1-${#ALL_CB_REGIONS[@]}]: " NUM_REGIONS
+  NUM_REGIONS=$(echo "$NUM_REGIONS" | tr -d ' ')
+  if [[ "$NUM_REGIONS" =~ ^[0-9]+$ ]] && \
+     [[ "$NUM_REGIONS" -ge 1 ]] && \
+     [[ "$NUM_REGIONS" -le "${#ALL_CB_REGIONS[@]}" ]]; then
+    break
+  fi
+  fail "Enter a number between 1 and ${#ALL_CB_REGIONS[@]}."
+done
+ok "$NUM_REGIONS region(s) will be scanned."
+echo ""
+
+# ── Ask which regions ─────────────────────────────────────────────────────────
+declare -a _CHOSEN_REGIONS=()
+for r in $(seq 1 "$NUM_REGIONS"); do
+  while true; do
+    read -rp "  Region $r of $NUM_REGIONS — enter number from list above: " R_CHOICE
+    R_CHOICE=$(echo "$R_CHOICE" | tr -d ' ')
+    if [[ "$R_CHOICE" =~ ^[0-9]+$ ]] && \
+       [[ "$R_CHOICE" -ge 1 ]] && \
+       [[ "$R_CHOICE" -le "${#ALL_CB_REGIONS[@]}" ]]; then
+      SEL_REGION=$(echo "${ALL_CB_REGIONS[$((R_CHOICE-1))]}" | awk '{print $1}')
+      _CHOSEN_REGIONS+=("$SEL_REGION")
+      ok "  Region $r: $SEL_REGION"
+      break
+    fi
+    fail "Invalid. Enter 1-${#ALL_CB_REGIONS[@]}."
+  done
+done
+echo ""
+
+# ── For each region, ask how many AZs then which ones ─────────────────────────
+declare -a FINAL_REGIONS=()
+declare -a FINAL_AZS=()
+
+for r in "${!_CHOSEN_REGIONS[@]}"; do
+  REG="${_CHOSEN_REGIONS[$r]}"
+  AZ_LIST="${REGION_AZS[$REG]:-}"
+  [[ -z "$AZ_LIST" ]] && AZ_LIST="${REG}a"
+  IFS=' ' read -ra AZ_ARRAY <<< "$AZ_LIST"
+  AZ_COUNT="${#AZ_ARRAY[@]}"
+
+  echo -e "${BOLD}  Availability Zones in $REG:${NC}"
+  echo ""
+  for i in "${!AZ_ARRAY[@]}"; do
+    printf "  ${CYAN}[%d]${NC}  %s\n" "$((i+1))" "${AZ_ARRAY[$i]}"
+  done
+  echo ""
+
+  while true; do
+    read -rp "  How many AZs in $REG to scan? [1-$AZ_COUNT]: " NUM_AZS
+    NUM_AZS=$(echo "$NUM_AZS" | tr -d ' ')
+    if [[ "$NUM_AZS" =~ ^[0-9]+$ ]] && \
+       [[ "$NUM_AZS" -ge 1 ]] && \
+       [[ "$NUM_AZS" -le "$AZ_COUNT" ]]; then
+      break
+    fi
+    fail "Enter 1-$AZ_COUNT."
+  done
+  ok "$NUM_AZS AZ(s) selected for $REG."
+  echo ""
+
+  for a in $(seq 1 "$NUM_AZS"); do
+    while true; do
+      read -rp "  AZ $a of $NUM_AZS in $REG — enter number: " AZ_CHOICE
+      AZ_CHOICE=$(echo "$AZ_CHOICE" | tr -d ' ')
+      if [[ "$AZ_CHOICE" =~ ^[0-9]+$ ]] && \
+         [[ "$AZ_CHOICE" -ge 1 ]] && \
+         [[ "$AZ_CHOICE" -le "$AZ_COUNT" ]]; then
+        SEL_AZ="${AZ_ARRAY[$((AZ_CHOICE-1))]}"
+        FINAL_REGIONS+=("$REG")
+        FINAL_AZS+=("$SEL_AZ")
+        ok "  AZ $a: $SEL_AZ"
+        break
+      fi
+      fail "Invalid. Enter 1-$AZ_COUNT."
+    done
+  done
+  echo ""
+done
+
+# ── Save to config.env and re-source ─────────────────────────────────────────
+REGIONS_CSV=$(IFS=','; echo "${FINAL_REGIONS[*]}")
+AZS_CSV=$(IFS=','; echo "${FINAL_AZS[*]}")
+
+sed -i "s|^REGIONS=.*|REGIONS=\"${REGIONS_CSV}\"|"                   "$CONFIG_FILE"
+sed -i "s|^AVAILABILITY_ZONES=.*|AVAILABILITY_ZONES=\"${AZS_CSV}\"|" "$CONFIG_FILE"
+sed -i "s|^AVAILABILITY_ZONE=.*|AVAILABILITY_ZONE=\"${FINAL_AZS[0]}\"|" "$CONFIG_FILE"
+sed -i "s|^AWS_REGION=.*|AWS_REGION=\"${FINAL_REGIONS[0]}\"|"        "$CONFIG_FILE"
+
+ok "Region and AZ selections saved to config.env"
+info "  Regions : $REGIONS_CSV"
+info "  AZs     : $AZS_CSV"
+
+# Re-source with updated values
+CLEAN_ENV_W="/tmp/config_wizard_$$.env"
+sed 's/\r//' "$CONFIG_FILE" > "$CLEAN_ENV_W"
+set +u; source "$CLEAN_ENV_W"; set -u
+rm -f "$CLEAN_ENV_W"
+
+# ── Build combination list ─────────────────────────────────────────────────────
+echo ""
+header "Step 4b / 6  Building combination list"
 
 COMBO_COUNT=0
 > /tmp/combinations_$$.txt
 
-IFS=',' read -ra TYPES   <<< "$INSTANCE_TYPES"
-IFS=',' read -ra REGIONS_LIST <<< "$REGIONS"
-IFS=',' read -ra AZS     <<< "$AVAILABILITY_ZONES"
+IFS=',' read -ra TYPES        <<< "$INSTANCE_TYPES"
+IFS=',' read -ra REGIONS_LIST <<< "$REGIONS_CSV"
+IFS=',' read -ra AZS_LIST     <<< "$AZS_CSV"
 
 for ITYPE in "${TYPES[@]}"; do
   for i in "${!REGIONS_LIST[@]}"; do
     IREGION=$(echo "${REGIONS_LIST[$i]}" | tr -d ' ')
-    IAZ=$(echo "${AZS[$i]:-${REGIONS_LIST[$i]}a}" | tr -d ' ')
+    IAZ=$(echo "${AZS_LIST[$i]:-${REGIONS_LIST[$i]}a}" | tr -d ' ')
     COMBO="${ITYPE}|${IREGION}|${IAZ}"
-    # Deduplicate
     if ! grep -qF "$COMBO" /tmp/combinations_$$.txt 2>/dev/null; then
       echo "$COMBO" >> /tmp/combinations_$$.txt
       COMBO_COUNT=$((COMBO_COUNT + 1))
