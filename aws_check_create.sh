@@ -92,7 +92,10 @@ if ! command -v aws &>/dev/null; then
 fi
 
 REGION="${AWS_REGION:-us-east-1}"
-AZ="${AVAILABILITY_ZONE:-us-east-1a}"
+# AZ1 — read from AVAILABILITY_ZONES (plural, set by main.sh wizard).
+# Fall back to AVAILABILITY_ZONE (legacy single field) then default.
+_AZ_FIRST=$(echo "${AVAILABILITY_ZONES:-}" | cut -d',' -f1 | tr -d ' ')
+AZ="${_AZ_FIRST:-${AVAILABILITY_ZONE:-us-east-1a}}"
 
 PROFILE_FLAG=""
 if [[ -n "${AWS_PROFILE:-}" ]]; then
@@ -191,8 +194,11 @@ if [[ -n "$CURRENT_SUBNET" ]]; then
     ok "Subnet '$CURRENT_SUBNET' exists  (AZ: $SUBNET_AZ, State: $SUBNET_STATE, Free IPs: $SUBNET_FREE)"
     SUBNET_EXISTS=true
     FOUND+=("Subnet: $CURRENT_SUBNET  AZ=$SUBNET_AZ")
-    [[ "$SUBNET_AZ" != "$AZ" ]] && \
-      warn "Subnet AZ ($SUBNET_AZ) ≠ AVAILABILITY_ZONE ($AZ) — Capacity Block launch will fail if they differ."
+    if [[ "$SUBNET_AZ" != "$AZ" ]]; then
+      warn "Subnet AZ ($SUBNET_AZ) ≠ first configured AZ ($AZ)"
+      warn "This subnet will not match the selected AZ — please re-select a subnet in $AZ"
+      SUBNET_EXISTS=false   # force re-selection
+    fi
   else
     warn "Subnet '$CURRENT_SUBNET' NOT found."
   fi
@@ -207,6 +213,7 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
   [[ -z "$DEFAULT_VPC" || "$DEFAULT_VPC" == "None" ]] && DEFAULT_VPC=""
 
   info "Scanning all VPCs for available subnets in region $REGION..."
+  info "Target AZ for subnet 1: $AZ  (subnets in this AZ shown in green)"
 
   ALL_RAW=$(aws_safe ec2 describe-subnets \
     --filters "Name=state,Values=available" \
@@ -306,9 +313,9 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
             dryrun "use custom subnet $CUSTOM_SUBNET in $CUSTOM_AZ"
             SKIPPED+=("Subnet: dry-run, would use custom $CUSTOM_SUBNET")
           else
-            patch_config "SUBNET_ID"          "$CUSTOM_SUBNET"
-            patch_config "AVAILABILITY_ZONE"  "$CUSTOM_AZ"
-            patch_config "AVAILABILITY_ZONES" "$CUSTOM_AZ"
+            patch_config "SUBNET_ID"         "$CUSTOM_SUBNET"
+            patch_config "AVAILABILITY_ZONE" "$CUSTOM_AZ"
+            # AVAILABILITY_ZONES (plural) is set by main.sh wizard — do not overwrite
             AZ="$CUSTOM_AZ"
             FOUND+=("Subnet: $CUSTOM_SUBNET  AZ=$CUSTOM_AZ  CIDR=$CUSTOM_CIDR")
           fi
@@ -337,18 +344,13 @@ if [[ "$SUBNET_EXISTS" == false ]]; then
 
       ok "Selected: $SEL_ID  AZ=$SEL_AZ  CIDR=$SEL_CIDR  VPC=$SEL_VPC"
 
-      if [[ "$SEL_AZ" != "$AZ" ]]; then
-        warn "Selected AZ ($SEL_AZ) differs from AVAILABILITY_ZONE config ($AZ)"
-        warn "Updating AVAILABILITY_ZONE in config.env to $SEL_AZ"
-      fi
-
       if [[ "$DRY_RUN" == true ]]; then
         dryrun "use subnet $SEL_ID  AZ=$SEL_AZ  VPC=$SEL_VPC"
         SKIPPED+=("Subnet: dry-run, would use $SEL_ID in $SEL_AZ")
       else
-        patch_config "SUBNET_ID"          "$SEL_ID"
-        patch_config "AVAILABILITY_ZONE"  "$SEL_AZ"
-        patch_config "AVAILABILITY_ZONES" "$SEL_AZ"
+        patch_config "SUBNET_ID"         "$SEL_ID"
+        patch_config "AVAILABILITY_ZONE" "$SEL_AZ"
+        # AVAILABILITY_ZONES (plural) is set by main.sh wizard — do not overwrite
         AZ="$SEL_AZ"
         FOUND+=("Subnet: $SEL_ID  AZ=$SEL_AZ  CIDR=$SEL_CIDR")
       fi
@@ -358,113 +360,140 @@ fi
 
 
 # =============================================================================
-# 2.5 SECOND SUBNET (for multi-AZ — only when AVAILABILITY_ZONES has 2+ AZs)
+# 2.5  ADDITIONAL SUBNETS — one per AZ beyond the first
+#       Fully dynamic: supports 2, 3, 4, 5... N AZs
+#       Keys: SUBNET_ID (AZ1), SUBNET_ID_AZ2, SUBNET_ID_AZ3, ... SUBNET_ID_AZN
+#       Driven by AVAILABILITY_ZONES count — never breaks regardless of N
 # =============================================================================
-header "2.5 / 8  Second Subnet  (multi-AZ)"
+header "2.5 / 8  Additional Subnets  (multi-AZ)"
 
-# Count how many AZs are configured
-AZ_COUNT=$(echo "${AVAILABILITY_ZONES:-}" | tr ',' '\n' | grep -v "^$" | wc -l | tr -d ' \t\r\n')
-AZ_COUNT="${AZ_COUNT//[^0-9]/}"
-AZ_COUNT="${AZ_COUNT:-1}"
+# Build AZ list — count is the source of truth, not key existence
+IFS=',' read -ra _ALL_AZS <<< "${AVAILABILITY_ZONES:-}"
+_TOTAL_AZS=${#_ALL_AZS[@]}
 
-if [[ "$AZ_COUNT" -lt 2 ]]; then
-  info "Single AZ configured — skipping second subnet check."
+if [[ "$_TOTAL_AZS" -lt 2 ]]; then
+  info "Single AZ configured — no additional subnets needed."
 else
-  AZ2=$(echo "${AVAILABILITY_ZONES:-}" | cut -d',' -f2 | tr -d ' ')
-  CURRENT_SUBNET2="${SUBNET_ID_AZ2:-}"
-  SUBNET2_EXISTS=false
+  info "$_TOTAL_AZS AZs configured — checking subnets for AZ 2 through $_TOTAL_AZS..."
+  _KEY_LIST="SUBNET_ID (AZ1)"
+  for _n in $(seq 2 "$_TOTAL_AZS"); do
+    _KEY_LIST="${_KEY_LIST}, SUBNET_ID_AZ${_n}"
+  done
+  info "Keys: $_KEY_LIST"
+  echo ""
 
-  if [[ -n "$CURRENT_SUBNET2" ]]; then
-    SUBNET2_LINE=$(aws_safe ec2 describe-subnets \
-      --subnet-ids "$CURRENT_SUBNET2" \
-      --query "Subnets[0].[AvailabilityZone,State,AvailableIpAddressCount]")
-    if [[ -n "$SUBNET2_LINE" && "$SUBNET2_LINE" != "None" ]]; then
-      S2_AZ=$(echo "$SUBNET2_LINE"    | awk '{print $1}')
-      S2_STATE=$(echo "$SUBNET2_LINE" | awk '{print $2}')
-      S2_FREE=$(echo "$SUBNET2_LINE"  | awk '{print $3}')
-      ok "Second subnet '$CURRENT_SUBNET2' exists  (AZ: $S2_AZ, State: $S2_STATE, Free IPs: $S2_FREE)"
-      SUBNET2_EXISTS=true
-      FOUND+=("Second subnet: $CURRENT_SUBNET2  AZ=$S2_AZ")
-      [[ "$S2_AZ" != "$AZ2" ]] && \
-        warn "Second subnet AZ ($S2_AZ) ≠ second AVAILABILITY_ZONES entry ($AZ2)"
-    else
-      warn "SUBNET_ID_AZ2 '$CURRENT_SUBNET2' NOT found in AWS."
-    fi
-  else
-    info "SUBNET_ID_AZ2 is empty — need a subnet in $AZ2"
-  fi
+  # Loop through every AZ beyond AZ1 — index 1..(N-1) in 0-based
+  for _AZ_IDX in $(seq 1 $((_TOTAL_AZS - 1))); do
+    _AZ_NUM=$((_AZ_IDX + 1))                         # 2, 3, 4, 5...
+    _TARGET_AZ=$(echo "${_ALL_AZS[$_AZ_IDX]}" | tr -d ' ')
+    _SUBNET_KEY="SUBNET_ID_AZ${_AZ_NUM}"             # SUBNET_ID_AZ2, SUBNET_ID_AZ3...
+    _CURRENT_SUBNET="${!_SUBNET_KEY:-}"               # read dynamically from environment
 
-  if [[ "$SUBNET2_EXISTS" == false ]]; then
-    info "Scanning for available subnets in $AZ2..."
-    echo ""
-    echo -e "${BOLD}  Subnets available in $AZ2:${NC}"
-    echo ""
+    echo -e "${BOLD}  Subnet $_AZ_NUM / $_TOTAL_AZS — AZ: $_TARGET_AZ${NC}"
+    _SUBNET_EXISTS=false
 
-    AZ2_RAW=$(aws_safe ec2 describe-subnets \
-      --filters "Name=state,Values=available" "Name=availabilityZone,Values=${AZ2}" \
-      --query "Subnets[*].[SubnetId,AvailabilityZone,CidrBlock,VpcId]" \
-      2>/dev/null | tr '\t' '|' || echo "")
-
-    if [[ -z "$AZ2_RAW" ]]; then
-      warn "No subnets found in $AZ2."
-      warn "Create one manually then set SUBNET_ID_AZ2 in config.env"
-      warn "  aws ec2 create-subnet --vpc-id <VPC_ID> --cidr-block <CIDR> --availability-zone $AZ2"
-      SKIPPED+=("Second subnet: none found in $AZ2 — create manually")
-    else
-      IDX2=1
-      declare -a S2_IDS=() S2_AZNS=() S2_CIDRS=() S2_VPCS=()
-      while IFS='|' read -r SID SAZ SCIDR SVPC; do
-        [[ -z "$SID" || "$SID" == "None" ]] && continue
-        printf "  ${GREEN}[%d]${NC}  %-26s  AZ: %-12s  CIDR: %-18s  VPC: %s\n" \
-          "$IDX2" "$SID" "$SAZ" "$SCIDR" "$SVPC"
-        S2_IDS+=("$SID"); S2_AZNS+=("$SAZ"); S2_CIDRS+=("$SCIDR"); S2_VPCS+=("$SVPC")
-        IDX2=$((IDX2+1))
-      done <<< "$AZ2_RAW"
-
-      echo ""
-      echo -e "  ${CYAN}[c]${NC}  Enter a custom subnet ID"
-      echo ""
-
-      TOTAL2=${#S2_IDS[@]}
-      if [[ $TOTAL2 -eq 1 ]]; then
-        CHOSEN2=0
-        info "Only one subnet in $AZ2 — selecting automatically."
+    # ── Check if already set and valid ────────────────────────────────────────
+    if [[ -n "$_CURRENT_SUBNET" ]]; then
+      _SN_LINE=$(aws_safe ec2 describe-subnets         --subnet-ids "$_CURRENT_SUBNET"         --query "Subnets[0].[AvailabilityZone,State,AvailableIpAddressCount]")
+      if [[ -n "$_SN_LINE" && "$_SN_LINE" != "None" ]]; then
+        _SN_AZ=$(echo "$_SN_LINE"    | awk '{print $1}')
+        _SN_STATE=$(echo "$_SN_LINE" | awk '{print $2}')
+        _SN_FREE=$(echo "$_SN_LINE"  | awk '{print $3}')
+        ok "$_SUBNET_KEY '$_CURRENT_SUBNET' exists  (AZ: $_SN_AZ, State: $_SN_STATE, Free IPs: $_SN_FREE)"
+        [[ "$_SN_AZ" != "$_TARGET_AZ" ]] &&           warn "Subnet AZ ($_SN_AZ) ≠ target AZ ($_TARGET_AZ) — launches into $_TARGET_AZ will fail"
+        _SUBNET_EXISTS=true
+        FOUND+=("Subnet AZ${_AZ_NUM}: $_CURRENT_SUBNET  AZ=$_SN_AZ")
       else
-        while true; do
-          read -rp "  Choose [1-${TOTAL2}] or c for custom: " CHOICE2
-          CHOICE2=$(echo "$CHOICE2" | tr -d ' ')
-          if [[ "$CHOICE2" == "c" || "$CHOICE2" == "C" ]]; then
-            read -rp "  Enter subnet ID (subnet-xxxx): " CUSTOM2
-            CUSTOM2=$(echo "$CUSTOM2" | tr -d ' ')
-            CUSTOM2_INFO=$(aws_safe ec2 describe-subnets \
-              --subnet-ids "$CUSTOM2" \
-              --query "Subnets[0].[SubnetId,AvailabilityZone]" 2>/dev/null || echo "")
-            if [[ -z "$CUSTOM2_INFO" || "$CUSTOM2_INFO" == "None" ]]; then
-              fail "Subnet '$CUSTOM2' not found. Try again."
-              continue
-            fi
-            CHOSEN_ID2="$CUSTOM2"
-            ok "Custom subnet: $CHOSEN_ID2"
-            [[ "$DRY_RUN" == false ]] && patch_config "SUBNET_ID_AZ2" "$CHOSEN_ID2"
-            SUBNET2_EXISTS=true
-            break
-          fi
-          if [[ "$CHOICE2" =~ ^[0-9]+$ ]] && [[ "$CHOICE2" -ge 1 ]] && [[ "$CHOICE2" -le "$TOTAL2" ]]; then
-            CHOSEN2=$((CHOICE2-1))
-            break
-          fi
-          fail "Invalid choice. Enter 1-${TOTAL2} or c."
-        done
+        warn "$_SUBNET_KEY '$_CURRENT_SUBNET' NOT found in AWS."
       fi
-
-      if [[ "$SUBNET2_EXISTS" == false ]]; then
-        CHOSEN_ID2="${S2_IDS[$CHOSEN2]}"
-        ok "Selected second subnet: $CHOSEN_ID2  AZ=${S2_AZNS[$CHOSEN2]}"
-        [[ "$DRY_RUN" == false ]] && patch_config "SUBNET_ID_AZ2" "$CHOSEN_ID2"
-        FOUND+=("Second subnet: $CHOSEN_ID2  AZ=${S2_AZNS[$CHOSEN2]}")
-      fi
+    else
+      info "$_SUBNET_KEY is empty — need a subnet in $_TARGET_AZ"
     fi
-  fi
+
+    # ── Ensure the SUBNET_ID_AZN key exists in config.env ────────────────────
+    # For AZ3, AZ4, AZ5... the key may not exist in config.env yet.
+    # grep for it — if missing, append it so patch_config can update it.
+    if ! grep -q "^${_SUBNET_KEY}=" "$CONFIG_FILE" 2>/dev/null; then
+      echo "${_SUBNET_KEY}=""" >> "$CONFIG_FILE"
+      info "Added ${_SUBNET_KEY} key to config.env"
+    fi
+
+    # ── Select subnet if not set or not found ─────────────────────────────────
+    if [[ "$_SUBNET_EXISTS" == false ]]; then
+      info "Scanning for available subnets in $_TARGET_AZ..."
+      echo ""
+
+      _AZN_RAW=$(aws_safe ec2 describe-subnets         --filters "Name=state,Values=available"                   "Name=availabilityZone,Values=${_TARGET_AZ}"         --query "Subnets[*].[SubnetId,AvailabilityZone,CidrBlock,VpcId]"         2>/dev/null | tr '	' '|' || echo "")
+
+      if [[ -z "$_AZN_RAW" ]]; then
+        warn "No subnets found in $_TARGET_AZ."
+        warn "Create one first:"
+        warn "Create one first: aws ec2 create-subnet --vpc-id <VPC_ID> --cidr-block <CIDR> --availability-zone $_TARGET_AZ"
+        warn "    --cidr-block <CIDR> --availability-zone $_TARGET_AZ"
+        warn "Then set $_SUBNET_KEY in config.env and re-run."
+        SKIPPED+=("$_SUBNET_KEY: none found in $_TARGET_AZ — create manually")
+      else
+        declare -a _SN_IDS=() _SN_AZS=() _SN_CIDRS=() _SN_VPCS=()
+        _IDX_N=1
+        while IFS='|' read -r _SID _SAZ _SCIDR _SVPC; do
+          [[ -z "$_SID" || "$_SID" == "None" ]] && continue
+          printf "  ${GREEN}[%d]${NC}  %-26s  AZ: %-12s  CIDR: %-18s  VPC: %s\n" \
+            "$_IDX_N" "$_SID" "$_SAZ" "$_SCIDR" "$_SVPC"
+          _SN_IDS+=("$_SID"); _SN_AZS+=("$_SAZ")
+          _SN_CIDRS+=("$_SCIDR"); _SN_VPCS+=("$_SVPC")
+          _IDX_N=$((_IDX_N + 1))
+        done <<< "$_AZN_RAW"
+
+        echo ""
+        echo -e "  ${CYAN}[c]${NC}  Enter a custom subnet ID"
+        echo ""
+
+        _TOTAL_SN=${#_SN_IDS[@]}
+        _CHOSEN_SN_IDX=0
+
+        if [[ $_TOTAL_SN -eq 1 ]]; then
+          info "Only one subnet in $_TARGET_AZ — selecting automatically."
+        else
+          while true; do
+            read -rp "  Choose [1-${_TOTAL_SN}] or c for custom: " _SN_CHOICE
+            _SN_CHOICE=$(echo "$_SN_CHOICE" | tr -d ' ')
+            if [[ "$_SN_CHOICE" == "c" || "$_SN_CHOICE" == "C" ]]; then
+              read -rp "  Enter subnet ID (subnet-xxxx): " _CUSTOM_SN
+              _CUSTOM_SN=$(echo "$_CUSTOM_SN" | tr -d ' ')
+              _CUSTOM_INFO=$(aws_safe ec2 describe-subnets \
+                --subnet-ids "$_CUSTOM_SN" \
+                --query "Subnets[0].[SubnetId,AvailabilityZone]" 2>/dev/null || echo "")
+              if [[ -z "$_CUSTOM_INFO" || "$_CUSTOM_INFO" == "None" ]]; then
+                fail "Subnet '$_CUSTOM_SN' not found. Try again."
+                continue
+              fi
+              ok "Custom subnet: $_CUSTOM_SN"
+              [[ "$DRY_RUN" == false ]] && patch_config "$_SUBNET_KEY" "$_CUSTOM_SN"
+              _SUBNET_EXISTS=true
+              break
+            fi
+            if [[ "$_SN_CHOICE" =~ ^[0-9]+$ ]] && \
+               [[ "$_SN_CHOICE" -ge 1 ]] && \
+               [[ "$_SN_CHOICE" -le "$_TOTAL_SN" ]]; then
+              _CHOSEN_SN_IDX=$((_SN_CHOICE - 1))
+              break
+            fi
+            fail "Invalid. Enter 1-${_TOTAL_SN} or c."
+            fail "Invalid. Enter 1-${_TOTAL_SN} or c."
+          done
+        fi
+
+        if [[ "$_SUBNET_EXISTS" == false ]]; then
+          _CHOSEN_SN_ID="${_SN_IDS[$_CHOSEN_SN_IDX]}"
+          ok "Selected: $_CHOSEN_SN_ID  AZ=${_SN_AZS[$_CHOSEN_SN_IDX]}"
+          [[ "$DRY_RUN" == false ]] && patch_config "$_SUBNET_KEY" "$_CHOSEN_SN_ID"
+          FOUND+=("$_SUBNET_KEY: $_CHOSEN_SN_ID  AZ=${_SN_AZS[$_CHOSEN_SN_IDX]}")
+        fi
+      fi
+      unset _SN_IDS _SN_AZS _SN_CIDRS _SN_VPCS
+    fi
+    echo ""
+  done
 fi
 
 # =============================================================================
@@ -1095,10 +1124,12 @@ resolve_ami() {
   # stderr (>&2) so only the bare AMI ID reaches stdout. Any extra text
   # captured by $() corrupts the variable and kills the script under set -e.
   local itype="$1"
-  local resolved_ami="${CB_AMI_ID:-}"
+  local resolved_ami=""
 
-  if [[ -z "$resolved_ami" || "$resolved_ami" == "ami-XXXXXXXX" ]]; then
-    warn "AMI_ID not set — auto-discovering correct AMI for $itype..." >&2
+  # Always auto-discover the latest AMI on every run.
+  # This ensures you always use the most recent Deep Learning AMI.
+  # The discovered AMI is saved to config.env automatically.
+  info "Auto-discovering latest Deep Learning AMI for $itype..." >&2
 
     if [[ "$itype" == trn* ]]; then
       info "Trainium instance — searching for Neuron AMI..." >&2
@@ -1179,7 +1210,6 @@ resolve_ami() {
       fail "Could not auto-discover AMI for $itype. Set AMI_ID in config.env and re-run." >&2
       exit 1
     fi
-  fi
   # Only the bare AMI ID to stdout — captured cleanly by $()
   echo "$resolved_ami"
 }
@@ -1195,7 +1225,14 @@ if [[ "$LT_NEEDS_UPDATE" == true ]]; then
   else
     # patch_config called here (outside subshell) to write AMI_ID to config.env
     # resolve_ami set CB_AMI_ID but could not call patch_config from inside $()
-    [[ -n "$CB_AMI_ID" ]] && patch_config "AMI_ID" "$CB_AMI_ID"
+    if [[ -n "$CB_AMI_ID" ]]; then
+      # Ensure AMI_ID key exists in config.env (user may have deleted it)
+      if ! grep -q "^AMI_ID=" "$CONFIG_FILE" 2>/dev/null; then
+        echo 'AMI_ID=""' >> "$CONFIG_FILE"
+        info "Added AMI_ID key to config.env"
+      fi
+      patch_config "AMI_ID" "$CB_AMI_ID"
+    fi
 
     info "Creating new launch template version..."
     info "  Instance type : $CB_INSTANCE_TYPE"
@@ -1228,6 +1265,16 @@ if [[ "$LT_EXISTS" == false ]]; then
   NEW_LT_NAME="${NEW_LT_NAME:-gpu-cb-lt}"
 
   RESOLVED_AMI=$(resolve_ami "$CB_INSTANCE_TYPE")
+
+  # ── Write discovered AMI to config.env so main.sh never errors on AMI_ID ──
+  if [[ -n "$CB_AMI_ID" ]]; then
+    if ! grep -q "^AMI_ID=" "$CONFIG_FILE" 2>/dev/null; then
+      echo 'AMI_ID=""' >> "$CONFIG_FILE"
+      info "Added AMI_ID key to config.env"
+    fi
+    patch_config "AMI_ID" "$CB_AMI_ID"
+    info "config.env → AMI_ID=\"$CB_AMI_ID\"  (auto-saved)"
+  fi
 
   if [[ -z "$CB_RESERVATION_ID" ]]; then
     warn "CAPACITY_RESERVATION_ID is empty — template will target 'open' capacity."

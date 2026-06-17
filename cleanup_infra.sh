@@ -4,19 +4,20 @@
 # Deletes ONLY the resources created by aws_check_create.sh — nothing else.
 #
 # WHAT IT READS — config.env keys written by aws_check_create.sh:
-#   KEY_PAIR_NAME         → EC2 key pair
-#   SUBNET_ID             → EC2 subnet
-#   SECURITY_GROUP_IDS    → EC2 security group(s)
-#   PLACEMENT_GROUP_NAME  → EC2 cluster placement group
-#   IAM_INSTANCE_PROFILE  → IAM instance profile  + role (name: <profile>-role)
-#   SNS_TOPIC_NAME        → SNS topic + all subscriptions
-#   LAUNCH_TEMPLATE_NAME  → EC2 launch template (ALL versions including those
-#   LAUNCH_TEMPLATE_ID      added by reserve.sh — the template itself belongs
-#                           to aws_check_create.sh)
-#   (hardcoded)           → CloudWatch alarm: gpu-capacity-block-expiry-reminder
-#   (hardcoded)           → IAM managed policy: gpu-deployment-permissions
-#                           (detach from user + delete all versions + delete policy)
-#                           Also removes old inline policy remnant if present.
+#   KEY_PAIR_NAME              → EC2 key pair
+#   SUBNET_ID                  → EC2 subnet (AZ1)
+#   SUBNET_ID_AZ2..AZN         → EC2 subnets for additional AZs (dynamic)
+#   AVAILABILITY_ZONES         → cleared after subnet deletion
+#   SECURITY_GROUP_IDS         → EC2 security group(s)
+#   PLACEMENT_GROUP_NAME       → EC2 cluster placement group
+#   IAM_INSTANCE_PROFILE       → IAM instance profile + role
+#   SNS_TOPIC_NAME             → SNS topic + all subscriptions
+#   LAUNCH_TEMPLATE_NAME       → EC2 launch template (ALL versions)
+#   LAUNCH_TEMPLATE_ID
+#   AMI_ID                     → cleared so next run auto-discovers latest
+#   INSTANCE_PLATFORM          → cleared so wizard prompts again next run
+#   (hardcoded)                → CloudWatch alarm: gpu-capacity-block-expiry-reminder
+#   (hardcoded)                → IAM managed policy: gpu-deployment-permissions
 #
 # WHAT IT NEVER TOUCHES — created by other scripts:
 #   reserve.sh        → Capacity Block reservation, SSM parameters
@@ -97,7 +98,13 @@ wipe() {
   local OWNED_KEYS=(
     KEY_PAIR_NAME
     SUBNET_ID
+    SUBNET_ID_AZ2
+    SUBNET_ID_AZ3
+    SUBNET_ID_AZ4
+    SUBNET_ID_AZ5
+    SUBNET_ID_AZ6
     AVAILABILITY_ZONE
+    AVAILABILITY_ZONES
     SECURITY_GROUP_IDS
     PLACEMENT_GROUP_NAME
     IAM_INSTANCE_PROFILE
@@ -105,6 +112,8 @@ wipe() {
     SNS_TOPIC_ARN
     LAUNCH_TEMPLATE_NAME
     LAUNCH_TEMPLATE_ID
+    AMI_ID
+    INSTANCE_PLATFORM
   )
   local allowed=false
   for k in "${OWNED_KEYS[@]}"; do
@@ -137,7 +146,7 @@ echo -e "  Account  : ${CYAN}${ACCOUNT_ID}${NC}"
 echo -e "  Region   : ${CYAN}${REGION}${NC}"
 echo ""
 
-# ── Read the 9 keys aws_check_create.sh owns ─────────────────────────────────
+# ── Read config.env keys owned by aws_check_create.sh ───────────────────────
 # These are the ONLY config.env keys this script reads.
 # It does not read CAPACITY_RESERVATION_ID, INSTANCE_IDS, WATCHER_* or any
 # key written by reserve.sh, launch.sh, monitor.sh, or deploy_watcher.sh.
@@ -173,7 +182,16 @@ pr "IAM instance profile " "$CK_PROFILE_NAME"
 pr "IAM role             " "$CK_ROLE_NAME"
 pr "Placement group      " "$CK_PG"
 pr "Security group(s)    " "$CK_SG"
-pr "Subnet               " "$CK_SUBNET"
+pr "Subnet (AZ1)          " "$CK_SUBNET"
+# Show additional AZ subnets if set
+_PR_AZN=2
+while true; do
+  _PR_KEY="SUBNET_ID_AZ${_PR_AZN}"
+  _PR_VAL="${!_PR_KEY:-}"
+  [[ -z "$_PR_VAL" ]] && break
+  pr "Subnet (AZ${_PR_AZN})          " "$_PR_VAL"
+  _PR_AZN=$((_PR_AZN + 1))
+done
 pr "Key pair             " "${CK_KEY_PAIR}  (.pem file removed too)"
 echo ""
 echo -e "  ${GREEN}${BOLD}Intentionally not touched by this script:${NC}"
@@ -577,43 +595,76 @@ else
 fi
 
 # =============================================================================
-# STEP 8 — Subnet
-# Created by: aws_check_create.sh section 2/8
-# Config key: SUBNET_ID
+# STEP 8 — Subnet(s)
+# Created by: aws_check_create.sh sections 2/8 and 2.5/8
+# Config keys: SUBNET_ID (AZ1), SUBNET_ID_AZ2, SUBNET_ID_AZ3 ... SUBNET_ID_AZN
 # Guard: never delete a default subnet
+# Loops through all SUBNET_ID_AZN keys dynamically
 # =============================================================================
-step 8 "Subnet"
+step 8 "Subnet(s)"
 
-if [[ -n "$CK_SUBNET" ]]; then
+# Build full list of subnet keys to check: SUBNET_ID + all SUBNET_ID_AZ2..AZN
+_SUBNET_KEYS=("SUBNET_ID")
+_AZN=2
+while grep -q "^SUBNET_ID_AZ${_AZN}=" "$CONFIG_FILE" 2>/dev/null; do
+  _SUBNET_KEYS+=("SUBNET_ID_AZ${_AZN}")
+  _AZN=$((_AZN + 1))
+done
+
+declare -a _DELETED_SUBNET_IDS=()   # track already-deleted IDs to skip duplicates
+
+for _SK in "${_SUBNET_KEYS[@]}"; do
+  _SID="${!_SK:-}"
+
+  if [[ -z "$_SID" ]]; then
+    did_skip "Subnet (${_SK}): not set in config.env"
+    wipe "$_SK"
+    continue
+  fi
+
+  # Guard: skip if this exact subnet ID was already deleted in this run
+  _ALREADY_DONE=false
+  for _PREV in "${_DELETED_SUBNET_IDS[@]:-}"; do
+    if [[ "$_PREV" == "$_SID" ]]; then
+      _ALREADY_DONE=true
+      break
+    fi
+  done
+  if [[ "$_ALREADY_DONE" == true ]]; then
+    warn "Subnet $_SID (${_SK}) is a duplicate of an already-deleted subnet — skipping"
+    wipe "$_SK"
+    continue
+  fi
+
   SUBNET_INFO=$(_ec2 describe-subnets \
-    --subnet-ids "$CK_SUBNET" \
-    --query "Subnets[0].[SubnetId,DefaultForAz,CidrBlock]")
+    --subnet-ids "$_SID" \
+    --query "Subnets[0].[SubnetId,DefaultForAz,CidrBlock,AvailabilityZone]")
 
   if [[ -n "$SUBNET_INFO" && "$SUBNET_INFO" != "None" ]]; then
     IS_DEFAULT=$(echo "$SUBNET_INFO" | awk '{print $2}')
     SUBNET_CIDR=$(echo "$SUBNET_INFO" | awk '{print $3}')
+    SUBNET_AZ=$(echo "$SUBNET_INFO"   | awk '{print $4}')
 
     if [[ "$IS_DEFAULT" == "True" ]]; then
-      warn "Subnet $CK_SUBNET is a DEFAULT subnet — protected, will not delete"
-      did_skip "Subnet: $CK_SUBNET (default subnet — protected)"
+      warn "Subnet $_SID (${_SK}) is a DEFAULT subnet — protected, will not delete"
+      did_skip "Subnet: $_SID (${_SK} — default subnet — protected)"
     else
       [[ "$DRY_RUN" == true ]] && \
-        dr "ec2 delete-subnet $CK_SUBNET (CIDR: $SUBNET_CIDR)" || {
-        _ec2 delete-subnet --subnet-id "$CK_SUBNET" && {
-          did_delete "Subnet: $CK_SUBNET (CIDR: $SUBNET_CIDR)"
-          wipe "SUBNET_ID"
-          wipe "AVAILABILITY_ZONE"
-        } || did_error "Subnet: $CK_SUBNET"
+        dr "ec2 delete-subnet $_SID  AZ=$SUBNET_AZ  CIDR=$SUBNET_CIDR  (${_SK})" || {
+        _ec2 delete-subnet --subnet-id "$_SID" && {
+          did_delete "Subnet: $_SID  AZ=$SUBNET_AZ  CIDR=$SUBNET_CIDR  (${_SK})"
+          _DELETED_SUBNET_IDS+=("$_SID")
+          wipe "$_SK"
+          [[ "$_SK" == "SUBNET_ID" ]] && wipe "AVAILABILITY_ZONE" && wipe "AVAILABILITY_ZONES"
+        } || did_error "Subnet: $_SID (${_SK})"
       }
     fi
   else
-    did_skip "Subnet: $CK_SUBNET (not found in AWS)"
-    wipe "SUBNET_ID"
-    wipe "AVAILABILITY_ZONE"
+    did_skip "Subnet: $_SID (${_SK} — not found in AWS)"
+    wipe "$_SK"
+    [[ "$_SK" == "SUBNET_ID" ]] && wipe "AVAILABILITY_ZONE" && wipe "AVAILABILITY_ZONES"
   fi
-else
-  did_skip "Subnet: SUBNET_ID not set in config.env"
-fi
+done
 
 # =============================================================================
 # STEP 9 — Key pair + local .pem file
@@ -694,6 +745,9 @@ if [[ ${#ERRORS[@]} -gt 0 ]]; then
 fi
 
 if [[ "$DRY_RUN" == false && ${#DELETED[@]} -gt 0 ]]; then
+  # Clear AMI_ID and INSTANCE_PLATFORM so next run re-discovers them fresh
+  wipe "AMI_ID"
+  wipe "INSTANCE_PLATFORM"
   echo -e "${GREEN}${BOLD}  config.env is now a clean slate.${NC}"
   echo -e "  ${CYAN}Run  bash main.sh  to start a fresh test cycle.${NC}"
   echo ""

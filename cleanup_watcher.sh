@@ -434,11 +434,35 @@ for idx in "${!SELECTED_IDS[@]}"; do
   if [[ "$DRY_RUN" == false ]]; then
     TS=$(date +%Y%m%d_%H%M%S)
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.${TS}"
+
+    # Watcher service fields
     sed -i 's|^WATCHER_STATE_MACHINE_ARN=.*|WATCHER_STATE_MACHINE_ARN=""|' "$CONFIG_FILE"
     sed -i 's|^WATCHER_DYNAMODB_TABLE=.*|WATCHER_DYNAMODB_TABLE=""|'       "$CONFIG_FILE"
     sed -i 's|^WATCHER_API_GATEWAY_URL=.*|WATCHER_API_GATEWAY_URL=""|'     "$CONFIG_FILE"
     sed -i 's|^WATCHER_LAMBDA_ROLE_ARN=.*|WATCHER_LAMBDA_ROLE_ARN=""|'     "$CONFIG_FILE"
+
+    # Reservation and launch fields (reset for next run)
+    sed -i 's|^CAPACITY_RESERVATION_ID=.*|CAPACITY_RESERVATION_ID=""|' "$CONFIG_FILE"
+    sed -i 's|^INSTANCE_IDS=.*|INSTANCE_IDS=""|'                       "$CONFIG_FILE"
+    sed -i 's|^LAUNCH_TIMESTAMP=.*|LAUNCH_TIMESTAMP=""|'               "$CONFIG_FILE"
+
+    # Region and AZ selections — cleared so main.sh wizard prompts again next run
+    sed -i 's|^REGIONS=.*|REGIONS=""|'                   "$CONFIG_FILE"
+    sed -i 's|^AVAILABILITY_ZONES=.*|AVAILABILITY_ZONES=""|' "$CONFIG_FILE"
+    sed -i 's|^AVAILABILITY_ZONE=.*|AVAILABILITY_ZONE=""|'   "$CONFIG_FILE"
+    sed -i 's|^INSTANCE_PLATFORM=.*|INSTANCE_PLATFORM=""|'    "$CONFIG_FILE"
+
+    # Dynamic subnet keys AZ2..AZN — clear all that exist
+    # SUBNET_ID and SUBNET_ID_AZ2 are kept (permanent infra) — only clear AZ3+
+    # (AZ3+ were added dynamically by aws_check_create.sh for the previous run)
+    _AZ_IDX=3
+    while grep -q "^SUBNET_ID_AZ${_AZ_IDX}=" "$CONFIG_FILE" 2>/dev/null; do
+      sed -i "s|^SUBNET_ID_AZ${_AZ_IDX}=.*|SUBNET_ID_AZ${_AZ_IDX}=""|" "$CONFIG_FILE"
+      _AZ_IDX=$((_AZ_IDX + 1))
+    done
+
     ok "config.env watcher fields cleared (backup: .bak.${TS})"
+    info "  Region/AZ selections cleared — wizard will prompt on next run"
   fi
 
 done

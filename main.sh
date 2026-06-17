@@ -51,15 +51,16 @@ info "Account : ${AWS_ACCOUNT_ID:-not set}"
 info "Region  : ${AWS_REGION:-not set}"
 info "Types   : ${INSTANCE_TYPES:-not set}"
 info "Count   : ${INSTANCE_COUNT:-not set}"
-info "Regions : ${REGIONS:-not set}"
-info "AZs     : ${AVAILABILITY_ZONES:-not set}"
+info "Regions : ${REGIONS:-will be chosen in Step 4}"
+info "AZs     : ${AVAILABILITY_ZONES:-will be chosen in Step 4}"
+info "Platform: ${INSTANCE_PLATFORM:-will be chosen in Step 4}"
 
 # Validate required fields
 [[ -z "${AWS_ACCOUNT_ID:-}" ]] && { fail "AWS_ACCOUNT_ID not set in config.env"; exit 1; }
 [[ -z "${ALERT_EMAIL:-}" ]]    && { fail "ALERT_EMAIL not set in config.env"; exit 1; }
 [[ -z "${INSTANCE_TYPES:-}" ]] && { fail "INSTANCE_TYPES not set in config.env"; exit 1; }
-[[ -z "${REGIONS:-}" ]]        && { fail "REGIONS not set in config.env"; exit 1; }
-[[ -z "${AVAILABILITY_ZONES:-}" ]] && { fail "AVAILABILITY_ZONES not set in config.env"; exit 1; }
+# REGIONS and AVAILABILITY_ZONES are filled by the interactive wizard in Step 4
+# — they do not need to be set in config.env before running
 
 # ── Step 2: Check AWS CLI and credentials ─────────────────────────────────────
 header "Step 2 / 6  Verifying AWS credentials"
@@ -239,6 +240,40 @@ for r in "${!_CHOSEN_REGIONS[@]}"; do
   echo ""
 done
 
+# ── Platform selection ────────────────────────────────────────────────────────
+echo -e "${BOLD}  Select instance platform:${NC}"
+echo ""
+PLATFORM_OPTIONS=(
+  "Linux/UNIX"
+  "Red Hat Enterprise Linux"
+  "RHEL with HA"
+  "SUSE Linux"
+  "Ubuntu Pro"
+)
+for i in "${!PLATFORM_OPTIONS[@]}"; do
+  if [[ $i -eq 0 ]]; then
+    printf "  ${GREEN}[%d]${NC}  %s  ${CYAN}(default)${NC}
+" "$((i+1))" "${PLATFORM_OPTIONS[$i]}"
+  else
+    printf "  ${GREEN}[%d]${NC}  %s
+" "$((i+1))" "${PLATFORM_OPTIONS[$i]}"
+  fi
+done
+echo ""
+
+while true; do
+  read -rp "  Choose platform [1-${#PLATFORM_OPTIONS[@]}] (press Enter for Linux/UNIX): " PLAT_CHOICE
+  PLAT_CHOICE=$(echo "$PLAT_CHOICE" | tr -d ' ')
+  [[ -z "$PLAT_CHOICE" ]] && PLAT_CHOICE="1"
+  if [[ "$PLAT_CHOICE" =~ ^[0-9]+$ ]] &&      [[ "$PLAT_CHOICE" -ge 1 ]] &&      [[ "$PLAT_CHOICE" -le "${#PLATFORM_OPTIONS[@]}" ]]; then
+    SELECTED_PLATFORM="${PLATFORM_OPTIONS[$((PLAT_CHOICE-1))]}"
+    ok "Platform: $SELECTED_PLATFORM"
+    break
+  fi
+  fail "Invalid. Enter 1-${#PLATFORM_OPTIONS[@]} or press Enter for default."
+done
+echo ""
+
 # ── Save to config.env and re-source ─────────────────────────────────────────
 REGIONS_CSV=$(IFS=','; echo "${FINAL_REGIONS[*]}")
 AZS_CSV=$(IFS=','; echo "${FINAL_AZS[*]}")
@@ -247,10 +282,12 @@ sed -i "s|^REGIONS=.*|REGIONS=\"${REGIONS_CSV}\"|"                   "$CONFIG_FI
 sed -i "s|^AVAILABILITY_ZONES=.*|AVAILABILITY_ZONES=\"${AZS_CSV}\"|" "$CONFIG_FILE"
 sed -i "s|^AVAILABILITY_ZONE=.*|AVAILABILITY_ZONE=\"${FINAL_AZS[0]}\"|" "$CONFIG_FILE"
 sed -i "s|^AWS_REGION=.*|AWS_REGION=\"${FINAL_REGIONS[0]}\"|"        "$CONFIG_FILE"
+sed -i "s|^INSTANCE_PLATFORM=.*|INSTANCE_PLATFORM=\"${SELECTED_PLATFORM}\"|" "$CONFIG_FILE"
 
-ok "Region and AZ selections saved to config.env"
-info "  Regions : $REGIONS_CSV"
-info "  AZs     : $AZS_CSV"
+ok "Region, AZ and platform selections saved to config.env"
+info "  Regions  : $REGIONS_CSV"
+info "  AZs      : $AZS_CSV"
+info "  Platform : $SELECTED_PLATFORM"
 
 # Re-source with updated values
 CLEAN_ENV_W="/tmp/config_wizard_$$.env"
@@ -321,7 +358,8 @@ if [[ "$DRY_RUN" == true ]]; then
     --start-date "${START_DATE}" \
     --alert-email "${ALERT_EMAIL}" \
     --retry-mins "${RETRY_INTERVAL_MINS:-15}" \
-    --max-hours "${MAX_RETRY_HOURS:-48}"
+    --max-hours "${MAX_RETRY_HOURS:-48}" \
+    --platform "${INSTANCE_PLATFORM:-Linux/UNIX}"
 else
   bash "$DEPLOY_SCRIPT" \
     --combinations "$COMBINATIONS" \
@@ -330,7 +368,8 @@ else
     --start-date "${START_DATE}" \
     --alert-email "${ALERT_EMAIL}" \
     --retry-mins "${RETRY_INTERVAL_MINS:-15}" \
-    --max-hours "${MAX_RETRY_HOURS:-48}"
+    --max-hours "${MAX_RETRY_HOURS:-48}" \
+    --platform "${INSTANCE_PLATFORM:-Linux/UNIX}"
 fi
 
 # ── Final message ─────────────────────────────────────────────────────────────

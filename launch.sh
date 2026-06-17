@@ -102,34 +102,47 @@ LT_ID="${LAUNCH_TEMPLATE_ID:-}"
 info "Using launch template: $LT_ID"
 
 # ── Pick correct subnet for the selected AZ ───────────────────────────────────
-# The launch template has one subnet (AZ1). If user chose a different AZ via
-# email, we must override the subnet to match the capacity reservation AZ.
-# Read AZ list from config.env to find which subnet index to use.
+# Builds a dynamic AZ→subnet map from config.env.
+# Supports any number of AZs: SUBNET_ID (AZ1), SUBNET_ID_AZ2, SUBNET_ID_AZ3...
+# The selected AZ is read from SSM (set by lambda_approve when user clicks PROCEED).
 SELECTED_AZ=$(get_param "az")
 SELECTED_AZ="${SELECTED_AZ:-}"
 
 LAUNCH_SUBNET_OVERRIDE=""
-if [[ -n "$SELECTED_AZ" ]]; then
-  # Build AZ → subnet map from config.env
-  IFS=',' read -ra _AZ_LIST   <<< "${AVAILABILITY_ZONES:-}"
-  # Subnet list: first entry = SUBNET_ID, subsequent = SUBNET_ID_AZ2, SUBNET_ID_AZ3 ...
-  _SUBNET_LIST=("${SUBNET_ID:-}")
-  [[ -n "${SUBNET_ID_AZ2:-}" ]] && _SUBNET_LIST+=("${SUBNET_ID_AZ2}")
-  [[ -n "${SUBNET_ID_AZ3:-}" ]] && _SUBNET_LIST+=("${SUBNET_ID_AZ3}")
 
+if [[ -n "$SELECTED_AZ" ]]; then
+  IFS=',' read -ra _AZ_LIST <<< "${AVAILABILITY_ZONES:-}"
+  _TOTAL_AZS=${#_AZ_LIST[@]}
+
+  # Build subnet list dynamically — driven by AZ count, not by empty key sentinel
+  # AZ 1 = SUBNET_ID, AZ 2 = SUBNET_ID_AZ2, AZ 3 = SUBNET_ID_AZ3 ... AZ N = SUBNET_ID_AZN
+  _SUBNET_LIST=()
+  for _si in $(seq 1 "$_TOTAL_AZS"); do
+    if [[ "$_si" -eq 1 ]]; then
+      _SUBNET_LIST+=("${SUBNET_ID:-}")
+    else
+      _KEY="SUBNET_ID_AZ${_si}"
+      _SUBNET_LIST+=("${!_KEY:-}")
+    fi
+  done
+
+  info "AZ → Subnet map (${_TOTAL_AZS} AZ(s) configured):"
   for _i in "${!_AZ_LIST[@]}"; do
-    _AZ_ENTRY=$(echo "${_AZ_LIST[$_i]}" | tr -d ' ')
-    if [[ "$_AZ_ENTRY" == "$SELECTED_AZ" ]]; then
-      LAUNCH_SUBNET_OVERRIDE="${_SUBNET_LIST[$_i]:-}"
-      break
+    _AZ_E=$(echo "${_AZ_LIST[$_i]}" | tr -d ' ')
+    _SN_E="${_SUBNET_LIST[$_i]:-}"
+    info "  AZ $((_i+1)): $_AZ_E → ${_SN_E:-(not set — launch will fail)}"
+    if [[ "$_AZ_E" == "$SELECTED_AZ" ]]; then
+      LAUNCH_SUBNET_OVERRIDE="$_SN_E"
     fi
   done
 fi
 
 if [[ -n "$LAUNCH_SUBNET_OVERRIDE" ]]; then
-  info "Subnet override for AZ $SELECTED_AZ : $LAUNCH_SUBNET_OVERRIDE"
+  ok "Subnet override for AZ $SELECTED_AZ : $LAUNCH_SUBNET_OVERRIDE"
+elif [[ -n "$SELECTED_AZ" ]]; then
+  warn "No subnet found for AZ $SELECTED_AZ — using launch template default (may fail)"
 else
-  info "No subnet override — using launch template default subnet"
+  info "No AZ selected — using launch template default subnet"
 fi
 
 # Build the run-instances command

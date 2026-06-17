@@ -55,6 +55,8 @@ RESERVE_COUNT=$(get_param "instance-count")
 UPFRONT_FEE=$(get_param "upfront-fee")
 RESERVE_START=$(get_param "start-date")
 RESERVE_END=$(get_param "end-date")
+RESERVE_PLATFORM=$(get_param "instance-platform")
+RESERVE_PLATFORM="${RESERVE_PLATFORM:-Linux/UNIX}"
 
 [[ -z "$OFFERING_ID" ]] && { fail "No offering ID found in SSM at ${SSM_PREFIX}/offering-id"; exit 1; }
 
@@ -66,6 +68,7 @@ info "Count       : $RESERVE_COUNT"
 info "Fee         : $UPFRONT_FEE"
 info "Start       : $RESERVE_START"
 info "End         : $RESERVE_END"
+info "Platform    : $RESERVE_PLATFORM"
 
 # ── Purchase the Capacity Block ───────────────────────────────────────────────
 header "2 / 6  Purchasing Capacity Block"
@@ -73,7 +76,7 @@ header "2 / 6  Purchasing Capacity Block"
 RESERVATION_ID=$(aws $PROFILE_FLAG ec2 purchase-capacity-block \
   --region "$RESERVE_REGION" \
   --capacity-block-offering-id "$OFFERING_ID" \
-  --instance-platform "Linux/UNIX" \
+  --instance-platform "${RESERVE_PLATFORM}" \
   --tag-specifications \
     "ResourceType=capacity-reservation,Tags=[\
 {Key=Name,Value=gpu-capacity-block},\

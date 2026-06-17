@@ -36,6 +36,7 @@ START_DATE=""
 ALERT_EMAIL=""
 RETRY_MINS="15"
 MAX_HOURS="48"
+INSTANCE_PLATFORM="Linux/UNIX"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --alert-email)       ALERT_EMAIL="$2"; shift ;;
     --retry-mins)        RETRY_MINS="$2"; shift ;;
     --max-hours)         MAX_HOURS="$2"; shift ;;
+    --platform)          INSTANCE_PLATFORM="$2"; shift ;;
   esac
   shift
 done
@@ -127,6 +129,7 @@ put_param "reserve-script"    "${ROOT_DIR}/reserve.sh"
 put_param "launch-script"     "${ROOT_DIR}/launch.sh"
 put_param "monitor-script"    "${ROOT_DIR}/monitor.sh"
 put_param "aws-region"        "$AWS_REGION"
+put_param "instance-platform" "$INSTANCE_PLATFORM"
 
 RESOLVED_SNS_ARN="${SNS_TOPIC_ARN:-}"
 if [[ -z "$RESOLVED_SNS_ARN" && -n "${SNS_TOPIC_NAME:-}" ]]; then
